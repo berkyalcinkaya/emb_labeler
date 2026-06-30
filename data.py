@@ -2,17 +2,20 @@
 
 Expected directory structure
 ----------------------------
-root_dataset/
-    patient_001/
-        F-45/*.tif
-        F-30/*.tif
-        F-15/*.tif
-        F0/*.tif
-        F15/*.tif
-        F30/*.tif
-        F45/*.tif
-    patient_002/
-        ...
+A dataset root holds one or more patient/embryo folders, each with focal-depth subdirs::
+
+    root_dataset/
+        patient_001/
+            F-45/*.tif
+            F-30/*.tif
+            ...
+            F45/*.tif
+        patient_002/
+            ...
+
+A *single* embryo folder is also accepted: if the loaded folder itself contains
+focal-depth subdirs (``F-45 … F45``) it is treated as one embryo rather than a
+collection of patients (see ``_looks_like_embryo_dir`` / ``DataSet.load_patient_series``).
 
 Each PatientTimeSeries stores image paths lazily. Images are only loaded when
 requested, unless load=True is passed.
@@ -34,6 +37,24 @@ ORDERED_FOCAL_DEPTH = ["F-45", "F-30", "F-15", "F0", "F15", "F30", "F45"]
 IMAGE_EXTENSIONS = (".png", ".jpeg", ".jpg", ".tif", ".tiff")
 
 _RUN_RE = re.compile(r"RUN(\d+)")
+
+
+def _looks_like_embryo_dir(directory: str) -> bool:
+    """True if ``directory`` directly contains focal-depth subfolders (``F-45 … F45``).
+
+    Used to distinguish a single embryo folder (whose children are focal depths) from a
+    dataset root (whose children are per-patient folders). A dataset root's immediate
+    children are patient names, none of which match ``ORDERED_FOCAL_DEPTH``, so this is a
+    reliable, cheap discriminator.
+    """
+    try:
+        entries = os.listdir(directory)
+    except OSError:
+        return False
+    return any(
+        name in ORDERED_FOCAL_DEPTH and os.path.isdir(os.path.join(directory, name))
+        for name in entries
+    )
 
 
 def run_sort_key(path: str) -> Tuple[Union[int, float], str]:
@@ -86,15 +107,45 @@ class DataSet:
         self.patient_series_list: List[PatientTimeSeries] = []
         self.load_patient_series()
 
+    @staticmethod
+    def discover_patient_dirs(directory: str) -> List[str]:
+        """Patient directories contained in ``directory``.
+
+        A single embryo folder (its children are focal depths) resolves to just itself;
+        otherwise each immediate subdirectory is treated as a separate patient. Paths are
+        absolute so callers can dedup reliably.
+        """
+        directory = os.path.abspath(directory)
+        if _looks_like_embryo_dir(directory):
+            return [directory]
+        return [
+            os.path.join(directory, subdir)
+            for subdir in sorted(os.listdir(directory))
+            if os.path.isdir(os.path.join(directory, subdir))
+        ]
+
     def load_patient_series(self) -> None:
         self.patient_series_list.clear()
-        patient_dirs = [
-            os.path.join(self.root_directory, subdir)
-            for subdir in sorted(os.listdir(self.root_directory))
-            if os.path.isdir(os.path.join(self.root_directory, subdir))
-        ]
-        for patient_dir in patient_dirs:
+        for patient_dir in self.discover_patient_dirs(self.root_directory):
             self.patient_series_list.append(PatientTimeSeries(patient_dir))
+
+    def add_directory(self, directory: str) -> List["PatientTimeSeries"]:
+        """Append patients found in ``directory`` to this dataset, skipping duplicates.
+
+        Lets the GUI accumulate embryos dropped from different folders into one dataset
+        instead of replacing the previous load. Patients already present (matched by
+        absolute directory) are skipped. Returns the newly added series, in load order.
+        """
+        existing = {patient.directory for patient in self.patient_series_list}
+        added: List["PatientTimeSeries"] = []
+        for patient_dir in self.discover_patient_dirs(directory):
+            if os.path.abspath(patient_dir) in existing:
+                continue
+            patient_ts = PatientTimeSeries(patient_dir)
+            self.patient_series_list.append(patient_ts)
+            existing.add(patient_ts.directory)
+            added.append(patient_ts)
+        return added
 
     def print_all_patient_series(self) -> None:
         for patient_ts in self.patient_series_list:

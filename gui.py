@@ -23,12 +23,16 @@ from PyQt5.QtWidgets import (
     QButtonGroup,
     QCheckBox,
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QFileDialog,
     QFrame,
     QGridLayout,
     QHBoxLayout,
     QInputDialog,
     QLabel,
+    QListWidget,
+    QListWidgetItem,
     QMainWindow,
     QMessageBox,
     QProgressBar,
@@ -219,6 +223,9 @@ class TaskProgressBar(QWidget):
     # --- state rendering -----------------------------------------------------
     def _set_state(self, state: str, status: str, tooltip: Optional[str] = None) -> None:
         """state ∈ {idle, running, done, error}; drives the chunk color via QSS."""
+        # Any active state re-enables a previously disabled bar (see set_disabled).
+        if not self.isEnabled():
+            self.setEnabled(True)
         if self.bar.property("state") != state:
             self.bar.setProperty("state", state)
             self.bar.style().unpolish(self.bar)
@@ -306,6 +313,17 @@ class TaskProgressBar(QWidget):
         self.bar.setValue(100)
         self._set_state("error", text, tooltip=tooltip)
 
+    def set_disabled(self, text: str, tooltip: Optional[str] = None) -> None:
+        """Gray the bar out and make it non-interactive (e.g. nothing to do).
+
+        Used for the whole-dataset prefetch when only one embryo is loaded. Any later
+        ``start``/``set_*`` call re-enables the widget (they route through ``_set_state``).
+        """
+        self.bar.setRange(0, 100)
+        self.bar.setValue(0)
+        self._set_state("idle", text, tooltip=tooltip)
+        self.setEnabled(False)
+
 
 class PiPContainer(QWidget):
     """Holds a full-bleed main widget with a small inset widget (picture-in-picture)
@@ -374,6 +392,129 @@ class FunctionWorker(QThread):
             self.failed.emit(str(exc))
 
 
+class SetupModelsDialog(QDialog):
+    """Model setup: pick a local model, download one from S3, or fetch the RCNN detector.
+
+    Replaces the old single combo box that crammed three unrelated operations into one
+    list. Here *selection* (the local-model list + "Use selected model") is separated from
+    *actions* (the S3 / RCNN download buttons), and a status block up top shows what's
+    active, whether the RCNN detector is installed, and the AWS sign-in state. The heavy
+    work runs through the parent app's existing worker helpers; this dialog passes
+    ``refresh_status`` as their completion hook so it updates in place when they finish.
+    """
+
+    def __init__(self, app: "EmbryoLabelingApp"):
+        super().__init__(app)
+        self.app = app
+        self.setWindowTitle("Setup Models")
+        self.setMinimumWidth(560)
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(8)
+
+        self.status_label = QLabel()
+        self.status_label.setTextFormat(Qt.RichText)
+        self.status_label.setWordWrap(True)
+        layout.addWidget(self.status_label)
+
+        layout.addWidget(self._hsep())
+
+        local_title = QLabel("Local models")
+        local_title.setStyleSheet("font-weight: 600;")
+        layout.addWidget(local_title)
+
+        self.model_list = QListWidget()
+        self.model_list.itemDoubleClicked.connect(lambda _item: self._use_selected())
+        layout.addWidget(self.model_list)
+
+        self.use_button = QPushButton("Use selected model")
+        self.use_button.clicked.connect(self._use_selected)
+        layout.addWidget(self.use_button)
+
+        layout.addWidget(self._hsep())
+
+        downloads_title = QLabel("Download from S3")
+        downloads_title.setStyleSheet("font-weight: 600;")
+        layout.addWidget(downloads_title)
+
+        actions = QHBoxLayout()
+        self.s3_button = QPushButton("Download model…")
+        self.s3_button.clicked.connect(self._download_from_s3)
+        self.rcnn_button = QPushButton("Fetch RCNN detector")
+        self.rcnn_button.clicked.connect(self._fetch_rcnn)
+        actions.addWidget(self.s3_button)
+        actions.addWidget(self.rcnn_button)
+        actions.addStretch(1)
+        layout.addLayout(actions)
+
+        button_box = QDialogButtonBox(QDialogButtonBox.Close)
+        button_box.rejected.connect(self.reject)
+        layout.addWidget(button_box)
+
+        self.refresh_status()
+
+    @staticmethod
+    def _hsep() -> QFrame:
+        line = QFrame()
+        line.setFrameShape(QFrame.HLine)
+        line.setStyleSheet(f"color: {C_BORDER};")
+        return line
+
+    def refresh_status(self) -> None:
+        """Re-read model/RCNN/AWS state and rebuild the status block + model list."""
+        self.app.refresh_aws_state()
+        active = self.app.selected_model
+        active_ready = bool(active) and not setup_models.missing_files(active)
+        rcnn_ok = setup_models.rcnn_present()
+        aws_ok = self.app._aws_authenticated
+
+        self.status_label.setText(
+            f"<b>Active model:</b> {active or '—'} "
+            f"({'ready' if active_ready else 'weights not downloaded'})<br>"
+            f"<b>RCNN detector:</b> rcnn.pt "
+            f"({'installed' if rcnn_ok else 'missing — predictions &amp; ROI need this'})<br>"
+            f"<b>AWS:</b> {self.app._aws_status_msg}"
+        )
+
+        self.model_list.clear()
+        local = setup_models.local_models()
+        for name in local:
+            item = QListWidgetItem(f"{name}   (active)" if name == active else name)
+            item.setData(Qt.UserRole, name)
+            self.model_list.addItem(item)
+            if name == active:
+                self.model_list.setCurrentItem(item)
+        if not local:
+            placeholder = QListWidgetItem("No local models — use “Download model…”.")
+            placeholder.setFlags(Qt.NoItemFlags)
+            self.model_list.addItem(placeholder)
+        if self.model_list.currentItem() is None and local:
+            self.model_list.setCurrentRow(0)
+
+        self.use_button.setEnabled(bool(local))
+        self.rcnn_button.setText("Re-fetch RCNN detector" if rcnn_ok else "Fetch RCNN detector")
+        # S3 buttons stay enabled even when signed out so clicking surfaces the
+        # sign-in guidance; the tooltip explains the state up front.
+        aws_tip = "" if aws_ok else self.app._aws_status_msg
+        self.s3_button.setToolTip(aws_tip)
+        self.rcnn_button.setToolTip(aws_tip)
+
+    def _selected_model_name(self) -> Optional[str]:
+        item = self.model_list.currentItem()
+        return item.data(Qt.UserRole) if item is not None else None
+
+    def _use_selected(self) -> None:
+        name = self._selected_model_name()
+        if name:
+            self.app._select_model(name, on_done=self.refresh_status)
+
+    def _download_from_s3(self) -> None:
+        self.app._fetch_and_choose_s3_model(on_done=self.refresh_status)
+
+    def _fetch_rcnn(self) -> None:
+        self.app._fetch_rcnn(on_done=self.refresh_status)
+
+
 class EmbryoLabelingApp(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -405,6 +546,8 @@ class EmbryoLabelingApp(QMainWindow):
         self._task_workers: List[FunctionWorker] = []
         self._progress_dialog: Optional[QProgressDialog] = None
         self._roi_worker: Optional[FunctionWorker] = None
+        # Whole-dataset prefetch worker (computes artifacts for non-current embryos).
+        self._prefetch_worker: Optional[FunctionWorker] = None
         self._pending_roi = None
         self._roi_detect_failed = False
 
@@ -627,8 +770,16 @@ class EmbryoLabelingApp(QMainWindow):
         self.task_ocr = TaskProgressBar("OCR")
         self.task_pred = TaskProgressBar("Pred")
         self.task_bbox = TaskProgressBar("ROI")
-        for task_bar in (self.task_ocr, self.task_pred, self.task_bbox):
+        # Whole-dataset prefetch: computes OCR/predictions/ROI for every *other* loaded
+        # embryo in the background so results are ready before the user navigates to them.
+        self.task_prefetch = TaskProgressBar("All embryos")
+        for task_bar in (self.task_ocr, self.task_pred, self.task_bbox, self.task_prefetch):
             layout.addWidget(task_bar)
+        # Prefetch only applies to multi-embryo datasets; gray it out until one loads.
+        self.task_prefetch.set_disabled(
+            "single embryo",
+            tooltip="Prefetch runs only when more than one embryo is loaded.",
+        )
 
         layout.addSpacing(6)
         hint = QLabel(
@@ -703,6 +854,11 @@ class EmbryoLabelingApp(QMainWindow):
 
         tools_menu.addSeparator()
         setup_action = QAction("Setup Models…", self)
+        # On macOS, Qt's native menu bar applies a text heuristic that relocates any item
+        # containing "setup"/"config"/"options"/"settings"/"preferences" into the
+        # application menu (as Preferences) — which is why "Setup Models…" vanished from
+        # Tools. Pin NoRole so it stays where it's added.
+        setup_action.setMenuRole(QAction.NoRole)
         setup_action.triggered.connect(self.setup_models_dialog)
         tools_menu.addAction(setup_action)
 
@@ -760,11 +916,16 @@ class EmbryoLabelingApp(QMainWindow):
             event.acceptProposedAction()
 
     def dropEvent(self, event) -> None:
-        for url in event.mimeData().urls():
-            directory = url.toLocalFile()
-            if os.path.isdir(directory):
-                self.load_dataset(directory)
-                break
+        # Accept every dropped directory and *add* them to the current dataset (drops from
+        # different folders accumulate instead of replacing). All embryos stay in the
+        # dropdown; File ▸ Open Dataset is the explicit "replace" path.
+        directories = [
+            url.toLocalFile()
+            for url in event.mimeData().urls()
+            if os.path.isdir(url.toLocalFile())
+        ]
+        if directories:
+            self.add_directories(directories)
 
     def open_dataset_dialog(self) -> None:
         directory = QFileDialog.getExistingDirectory(self, "Open dataset folder")
@@ -772,21 +933,91 @@ class EmbryoLabelingApp(QMainWindow):
             self.load_dataset(directory)
 
     def load_dataset(self, directory: str) -> None:
+        """Replace the current dataset with the contents of ``directory`` (menu open)."""
         try:
+            self.task_prefetch.cancel()
+            self._prefetch_worker = None
             self.dataset = DataSet(directory)
             self.update_patient_list()
             self.ensure_model_ready()
             self.auto_select_first_patient()
+            self.start_prefetch_all_patients()
             QMessageBox.information(self, "Success", f"Loaded dataset from {directory}")
         except Exception as exc:
             QMessageBox.critical(self, "Error", f"Failed to load dataset from {directory}\n{exc}")
 
+    def add_directories(self, directories: List[str]) -> None:
+        """Add embryo/patient directories to the current dataset (drag-and-drop path).
+
+        Bootstraps a new dataset from the first directory if none is loaded yet, then
+        merges the rest; otherwise appends to the existing dataset. Duplicates are skipped
+        and the user's current patient selection is preserved across the rebuild.
+        """
+        try:
+            # Stop prefetch so it doesn't race the patient list it's iterating.
+            self.task_prefetch.cancel()
+            self._prefetch_worker = None
+
+            bootstrap = self.dataset is None
+            pending = list(directories)
+            if bootstrap:
+                self.dataset = DataSet(pending.pop(0))
+            before = self.dataset.num_patients()
+            for directory in pending:
+                self.dataset.add_directory(directory)
+            added = self.dataset.num_patients() - (0 if bootstrap else before)
+
+            self.ensure_model_ready()
+            self.update_patient_list()
+            if bootstrap:
+                self.auto_select_first_patient()
+            self.start_prefetch_all_patients()
+
+            total = self.dataset.num_patients()
+            if added <= 0:
+                QMessageBox.information(
+                    self, "Already loaded", "Those embryos are already in the dropdown."
+                )
+            else:
+                QMessageBox.information(
+                    self, "Embryos added", f"Added {added} embryo(s). {total} now loaded."
+                )
+        except Exception as exc:
+            QMessageBox.critical(self, "Error", f"Failed to add embryos\n{exc}")
+
+    def _patient_display_names(self) -> List[str]:
+        """Dropdown labels for each patient, disambiguated when basenames collide.
+
+        Embryos dropped from different folders often share a basename (e.g. ``Emb1``);
+        such duplicates get their parent folder appended so the dropdown stays unambiguous.
+        """
+        series = self.dataset.get_patient_series() if self.dataset else []
+        names = [os.path.basename(patient.directory) for patient in series]
+        counts = Counter(names)
+        labels: List[str] = []
+        for patient, name in zip(series, names):
+            if counts[name] > 1:
+                parent = os.path.basename(os.path.dirname(patient.directory))
+                labels.append(f"{name}  ({parent})")
+            else:
+                labels.append(name)
+        return labels
+
     def update_patient_list(self) -> None:
+        # Preserve the current selection across rebuilds — adding embryos must not yank
+        # the user off the patient they're labeling.
+        current_dir = self.current_patient_ts.directory if self.current_patient_ts else None
         self.patient_combo.blockSignals(True)
         self.patient_combo.clear()
+        restore_index = -1
         if self.dataset:
-            for patient_ts in self.dataset.get_patient_series():
-                self.patient_combo.addItem(os.path.basename(patient_ts.directory))
+            series = self.dataset.get_patient_series()
+            for index, (patient_ts, label) in enumerate(zip(series, self._patient_display_names())):
+                self.patient_combo.addItem(label)
+                if patient_ts.directory == current_dir:
+                    restore_index = index
+        if restore_index >= 0:
+            self.patient_combo.setCurrentIndex(restore_index)
         self.patient_combo.blockSignals(False)
 
     def auto_select_first_patient(self) -> None:
@@ -831,6 +1062,9 @@ class EmbryoLabelingApp(QMainWindow):
         # Auto-compute OCR / predictions / ROI boxes in the background (stale or
         # missing results are recomputed; already-current ones are skipped).
         self.start_background_tasks(self.current_patient_ts)
+        # Keep the whole-dataset prefetch alive so it keeps filling in the other embryos
+        # (and picks up any patient left uncomputed by a cancelled foreground task).
+        self.start_prefetch_all_patients()
 
     # ------------------------------------------------------------------
     # Image display and navigation
@@ -1282,28 +1516,37 @@ class EmbryoLabelingApp(QMainWindow):
         self.select_model(DEFAULT_MODEL)
 
     def setup_models_dialog(self) -> None:
-        self.refresh_aws_state()
-        local = setup_models.local_models()
-        fetch_label = "⟳ Fetch model list from S3…"
-        items = local + [fetch_label]
-        choice, ok = QInputDialog.getItem(
-            self,
-            "Setup Models",
-            "Choose a local model, or fetch the list from S3:",
-            items,
-            0,
-            False,
-        )
-        if not ok:
-            return
-        if choice == fetch_label:
-            if not self._require_aws_or_warn():
-                return
-            self._fetch_and_choose_s3_model()
-            return
-        self._select_model(choice)
+        """Open the model-setup dialog (select a local model / download / fetch RCNN)."""
+        SetupModelsDialog(self).exec_()
 
-    def _fetch_and_choose_s3_model(self) -> None:
+    def _fetch_rcnn(self, on_done=None) -> None:
+        """Download just the RCNN detector weights (repairs a missing/failed rcnn.pt)."""
+        if not self._require_aws_or_warn():
+            return
+
+        def job(progress_cb, message_cb, should_cancel):
+            return setup_models.download_rcnn(
+                overwrite=True, progress_cb=message_cb, should_cancel=should_cancel
+            )
+
+        def on_success(_downloaded):
+            # Re-enable per-frame ROI detection that was disabled when the weights were
+            # missing, and refresh the chip + ROI view now that the detector can load.
+            self._roi_detect_failed = False
+            self._update_model_chip()
+            self.refresh_roi_view()
+            if on_done is not None:
+                on_done()
+            QMessageBox.information(
+                self, "RCNN ready", "RCNN detector weights (rcnn.pt) are installed."
+            )
+
+        self._run_worker("Fetch RCNN weights", job, on_success, determinate=False)
+
+    def _fetch_and_choose_s3_model(self, on_done=None) -> None:
+        if not self._require_aws_or_warn():
+            return
+
         def job(progress_cb, message_cb, should_cancel):
             message_cb("Listing models in s3://cfai-model-weights …")
             return setup_models.list_s3_models()
@@ -1316,14 +1559,16 @@ class EmbryoLabelingApp(QMainWindow):
                 self, "Setup Models", "Choose a model to download/use:", models, 0, False
             )
             if ok and choice:
-                self._select_model(choice)
+                self._select_model(choice, on_done=on_done)
 
         self._run_worker("Fetch S3 model list", job, on_success, determinate=False)
 
-    def _select_model(self, model_name: str) -> None:
+    def _select_model(self, model_name: str, on_done=None) -> None:
         missing = setup_models.missing_files(model_name)
         if not missing:
             self.select_model(model_name)
+            if on_done is not None:
+                on_done()
             QMessageBox.information(
                 self, "Model ready", f"'{model_name}' is ready for predictions."
             )
@@ -1339,9 +1584,9 @@ class EmbryoLabelingApp(QMainWindow):
         )
         if response != QMessageBox.Yes:
             return
-        self._download_and_select(model_name)
+        self._download_and_select(model_name, on_done=on_done)
 
-    def _download_and_select(self, model_name: str) -> None:
+    def _download_and_select(self, model_name: str, on_done=None) -> None:
         """Download ``model_name`` (+ rcnn.pt) from S3, then make it the active model."""
         def job(progress_cb, message_cb, should_cancel):
             return setup_models.download_model(
@@ -1350,6 +1595,10 @@ class EmbryoLabelingApp(QMainWindow):
 
         def on_success(_downloaded):
             self.select_model(model_name)
+            # A fresh model download also pulls rcnn.pt, so ROI detection may be usable again.
+            self._roi_detect_failed = False
+            if on_done is not None:
+                on_done()
             QMessageBox.information(
                 self, "Download complete", f"'{model_name}' is ready for predictions."
             )
@@ -1519,6 +1768,132 @@ class EmbryoLabelingApp(QMainWindow):
                     on_success(result)
 
         task_widget.start(worker, on_success=succeeded)
+
+    # ------------------------------------------------------------------
+    # Whole-dataset prefetch
+    #
+    # The foreground task bars above cover only the *current* embryo. This worker walks
+    # every other loaded embryo and computes any missing OCR / predictions / ROI boxes,
+    # so navigating to a new embryo finds its results already cached. It runs on a single
+    # background thread, re-scans each pass (to pick up embryos a cancelled foreground
+    # task left uncomputed), and always skips whichever embryo is currently displayed so
+    # it never double-computes against the foreground tasks.
+    # ------------------------------------------------------------------
+    def _current_prefetch_model(self) -> Optional[str]:
+        """The active model name if its weights are present locally, else None.
+
+        Predictions and ROI detection need weights (rcnn.pt ships with the model); OCR
+        does not. Returning None disables the model-dependent prefetch steps while still
+        allowing OCR to run.
+        """
+        name = self.selected_model
+        if name and not setup_models.missing_files(name):
+            return name
+        return None
+
+    def _patient_needs_bbox(self, patient) -> bool:
+        for depth_index in patient.populated_depth_indices():
+            depth_name = patient.get_depth_name(depth_index)
+            for timepoint in range(patient.num_timepoints()):
+                if not patient.has_rcnn_box(depth_name, timepoint):
+                    return True
+        return False
+
+    def _patient_needs_prefetch(self, patient, model_name: Optional[str]) -> bool:
+        if patient.num_timepoints() == 0:
+            return False
+        if not (ocr_module.has_ocr_times(patient) and not ocr_module.ocr_stale(patient)):
+            return True
+        if model_name:
+            if not patient.has_predictions() or predmod.predictions_stale(patient):
+                return True
+            if self._patient_needs_bbox(patient):
+                return True
+        return False
+
+    def start_prefetch_all_patients(self) -> None:
+        """(Re)start the background prefetch over all loaded embryos.
+
+        No-ops if a prefetch worker is already running — it re-scans each pass, so it
+        will pick up any newly-needed embryo on its own. Otherwise a fresh worker starts
+        (covering gaps left after a previous worker finished).
+        """
+        if self.dataset is None or self.dataset.num_patients() <= 1:
+            # Nothing to prefetch with a single embryo — gray the bar out and say why.
+            self.task_prefetch.set_disabled(
+                "single embryo",
+                tooltip="Prefetch runs only when more than one embryo is loaded.",
+            )
+            return
+        if self._prefetch_worker is not None and self._prefetch_worker.isRunning():
+            return
+        worker = FunctionWorker(self._prefetch_job, self)
+        self._prefetch_worker = worker
+        self._task_workers.append(worker)  # keep referenced + cancelled on close
+        self.task_prefetch.start(worker, on_success=self._on_prefetch_done)
+
+    def _on_prefetch_done(self, _result) -> None:
+        self._prefetch_worker = None
+
+    def _prefetch_job(self, progress_cb, message_cb, should_cancel):
+        """Worker body: compute missing artifacts for every non-current embryo.
+
+        Runs off the UI thread. ``attempted`` (keyed by object id) bounds the work to one
+        attempt per embryo so a repeatedly-failing compute can't spin forever; the worker
+        is restarted on dataset load / navigation, which clears it to retry later.
+        """
+        dataset = self.dataset
+        if dataset is None:
+            return
+        model_name = self._current_prefetch_model()
+        attempted: set = set()
+        while not should_cancel():
+            patients = [p for p in dataset.get_patient_series() if p.num_timepoints() > 0]
+            total = len(patients)
+            current = self.current_patient_ts
+            pending = [
+                p
+                for p in patients
+                if id(p) not in attempted
+                and p is not current
+                and self._patient_needs_prefetch(p, model_name)
+            ]
+            progress_cb(total - len(pending), total)
+            if not pending:
+                break
+            patient = pending[0]
+            attempted.add(id(patient))
+            message_cb(os.path.basename(patient.directory))
+
+            # Re-check `is current` before each step: the user may have navigated to this
+            # embryo, in which case the foreground tasks own it — leave it to them.
+            def claimable() -> bool:
+                return not should_cancel() and patient is not self.current_patient_ts
+
+            if claimable() and not (
+                ocr_module.has_ocr_times(patient) and not ocr_module.ocr_stale(patient)
+            ):
+                try:
+                    ocr_module.compute_and_save_ocr_times(patient, should_cancel=should_cancel)
+                except Exception:
+                    pass
+            if model_name and claimable() and (
+                not patient.has_predictions() or predmod.predictions_stale(patient)
+            ):
+                try:
+                    predmod.compute_and_save_predictions(
+                        patient, model_name, should_cancel=should_cancel
+                    )
+                except Exception:
+                    pass
+            if model_name and claimable() and self._patient_needs_bbox(patient):
+                depths = [patient.get_depth_name(i) for i in patient.populated_depth_indices()]
+                try:
+                    rcnn_roi.detect_boxes_for_patient(
+                        patient, depths=depths, should_cancel=should_cancel
+                    )
+                except Exception:
+                    pass
 
     def run_ocr(self) -> None:
         if self.current_patient_ts is None:

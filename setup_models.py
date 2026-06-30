@@ -20,7 +20,11 @@ from typing import Callable, List, Optional
 import embpred_backend as eb
 
 BUCKET = "cfai-model-weights"
+# Local filename embpred expects in MODELS_DIR (what the model loader reads).
 RCNN_FILENAME = eb.RCNN_FILENAME
+# The RCNN weights are stored under a different key in S3 than the local filename
+# embpred loads, so the download must map the S3 key -> local name explicitly.
+RCNN_S3_KEY = "faster_rcnn.pt"
 
 
 class AwsUnavailableError(RuntimeError):
@@ -158,15 +162,20 @@ def is_ready(model_name: str) -> bool:
 # Downloading.
 # --------------------------------------------------------------------------------------
 def _download_key(
-    filename: str,
-    dest_dir: str,
+    s3_key: str,
+    dest: str,
     progress_cb: Optional[Callable[[str], None]] = None,
     should_cancel: Optional[Callable[[], bool]] = None,
 ) -> None:
+    """Download a single ``s3_key`` from the bucket to the local path ``dest``.
+
+    The S3 key and the local filename can differ (e.g. ``faster_rcnn.pt`` in the bucket
+    is saved locally as ``rcnn.pt``, the name embpred's loader expects).
+    """
     _require_aws()
-    os.makedirs(dest_dir, exist_ok=True)
-    source = f"s3://{BUCKET}/{filename}"
-    dest = os.path.join(dest_dir, filename)
+    os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
+    source = f"s3://{BUCKET}/{s3_key}"
+    filename = s3_key
     if progress_cb:
         progress_cb(f"Downloading {filename} …")
 
@@ -212,20 +221,49 @@ def download_model(
     ``overwrite`` is set. Raises AwsUnavailableError / AwsAuthError on CLI / auth issues.
     """
     dest_dir = eb.models_dir()
-    wanted = [f"{model_name}.pth"]
+    # (S3 key, local filename) — these differ for the RCNN weights (faster_rcnn.pt in
+    # the bucket, rcnn.pt locally).
+    wanted = [(f"{model_name}.pth", f"{model_name}.pth")]
     if include_rcnn:
-        wanted.append(RCNN_FILENAME)
+        wanted.append((RCNN_S3_KEY, RCNN_FILENAME))
 
     downloaded: List[str] = []
-    for filename in wanted:
-        target = os.path.join(dest_dir, filename)
+    for s3_key, local_name in wanted:
+        target = os.path.join(dest_dir, local_name)
         if os.path.exists(target) and not overwrite:
             if progress_cb:
-                progress_cb(f"{filename} already present — skipping.")
+                progress_cb(f"{local_name} already present — skipping.")
             continue
-        _download_key(filename, dest_dir, progress_cb=progress_cb, should_cancel=should_cancel)
-        downloaded.append(filename)
+        _download_key(s3_key, target, progress_cb=progress_cb, should_cancel=should_cancel)
+        downloaded.append(local_name)
 
     if downloaded:
         eb.clear_model_cache()  # force reload of freshly downloaded weights
     return downloaded
+
+
+def rcnn_present() -> bool:
+    """True if the RCNN detector weights (rcnn.pt) are already in MODELS_DIR."""
+    return os.path.exists(eb.rcnn_path())
+
+
+def download_rcnn(
+    overwrite: bool = True,
+    progress_cb: Optional[Callable[[str], None]] = None,
+    should_cancel: Optional[Callable[[], bool]] = None,
+) -> bool:
+    """Download just the RCNN detector weights (``faster_rcnn.pt`` -> local ``rcnn.pt``).
+
+    Used to repair installs where the classifier downloaded but the RCNN weights did not
+    (e.g. the earlier wrong-key 404). Defaults to ``overwrite`` so an explicit fetch also
+    replaces a partial/corrupt file. Returns True if a download happened. Raises
+    AwsUnavailableError / AwsAuthError on CLI / auth issues.
+    """
+    target = os.path.join(eb.models_dir(), RCNN_FILENAME)
+    if os.path.exists(target) and not overwrite:
+        if progress_cb:
+            progress_cb(f"{RCNN_FILENAME} already present — skipping.")
+        return False
+    _download_key(RCNN_S3_KEY, target, progress_cb=progress_cb, should_cancel=should_cancel)
+    eb.clear_model_cache()  # drop any failed/None cached detector so it reloads
+    return True
