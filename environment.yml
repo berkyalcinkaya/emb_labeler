@@ -1,0 +1,30 @@
+# Conda/mamba environment for the embryo labeler, including the optional
+# assisted-labeling stack (predictions / RCNN ROI / OCR).
+#
+# Create:   mamba env create -f environment.yml
+# Activate: mamba activate emb_labeler
+# Run:      python gui.py        (from /Users/berk/code/emb_labeler)
+#
+# Python 3.12 matches embpred_deploy's recommended runtime. The editable install of
+# embpred_deploy (sibling checkout) pulls torch / torchvision / opencv-python-headless /
+# tqdm; rapidocr + onnxruntime power OCR time extraction. On Apple Silicon, pip's torch
+# is CPU/MPS (no CUDA).
+name: emb_labeler
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - pip
+  # Core labeling GUI
+  - numpy
+  - scikit-image
+  - matplotlib
+  - pyqt>=5.15          # provides PyQt5
+  - pyqtgraph>=0.13
+  - pip:
+      # embpred_deploy (sibling checkout) — brings torch, torchvision,
+      # opencv-python-headless, tqdm.
+      - "-e /Users/berk/code/embpred_deploy"
+      # OCR timestamp extraction
+      - rapidocr
+      - onnxruntime

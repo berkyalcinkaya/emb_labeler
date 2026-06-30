@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+
+# macOS
+.DS_Store
+
+# Editor / tooling
+.idea/
+.vscode/
+
+# Claude Code local settings
+.claude/settings.local.json
+
+# Local sample/test datasets (kept out of source per project conventions)
+test_data/
+
+# Model weights / large artifacts
+*.pt
+*.pth
+*.onnx

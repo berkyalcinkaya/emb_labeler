@@ -1,0 +1,27 @@
+# Core labeling GUI (always required)
+PyQt5>=5.15
+pyqtgraph>=0.13
+numpy>=1.23
+scikit-image>=0.20
+matplotlib>=3.7
+
+# --- Optional: assisted-labeling features ---------------------------------
+# These power model predictions, RCNN ROI detection, and OCR timestamps. They are
+# imported lazily, so the core labeler still runs (with center-crop ROIs and no
+# predictions) if they are absent. Install them in the same environment as the GUI
+# so the RCNN model can be shared between inference and get_ROI.
+#
+# embpred_deploy provides the classifier + Faster-RCNN. Install it (pip install
+# embpred_deploy) or keep the sibling checkout at ../embpred_deploy; either way it
+# needs torch/torchvision/opencv. See embpred_deploy/README.md.
+#   torch
+#   torchvision
+#   opencv-python            # or opencv-python-headless
+#   embpred_deploy
+#
+# OCR timestamp extraction (Tools > Run OCR Times):
+#   rapidocr                 # the RapidOCR package used by Notebook_OCR.ipynb
+#   onnxruntime
+#
+# Model-weight download (Tools > Setup Models) shells out to the AWS CLI (`aws`),
+# which must be installed and configured separately (see README).
