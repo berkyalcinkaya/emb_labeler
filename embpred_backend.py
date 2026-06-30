@@ -120,12 +120,34 @@ def _import_torch():
 # --------------------------------------------------------------------------------------
 # Weight-file discovery (torch-free).
 # --------------------------------------------------------------------------------------
-def models_dir() -> str:
-    """Absolute path of embpred_deploy's MODELS_DIR (where weights live)."""
-    _ensure_embpred_importable()
-    from embpred_deploy.config import MODELS_DIR  # lightweight (pathlib only)
+# Environment override for the weights cache location.
+MODELS_DIR_ENV = "EMB_LABELER_MODELS_DIR"
 
-    return str(MODELS_DIR)
+
+def labeler_models_dir() -> str:
+    """Absolute path of the labeler-owned weights cache.
+
+    Weights live in a labeler-owned cache dir rather than inside the embpred_deploy
+    package: ``$EMB_LABELER_MODELS_DIR`` if set, else ``~/.cache/emb_labeler/models``.
+    This survives reinstalls/upgrades of embpred_deploy and never writes into a
+    pip-managed ``site-packages`` directory. The labeler always passes explicit weight
+    paths into embpred's loaders (``load_model``/``load_faster_RCNN_model_device`` take
+    a path, and ``inference`` takes already-loaded models), so embpred's own
+    ``MODELS_DIR`` constant is never consulted at runtime.
+    """
+    override = os.environ.get(MODELS_DIR_ENV)
+    if override:
+        return os.path.abspath(os.path.expanduser(override))
+    return os.path.join(os.path.expanduser("~"), ".cache", "emb_labeler", "models")
+
+
+def models_dir() -> str:
+    """Absolute path of the directory where model weights live (labeler-owned cache).
+
+    Pure path resolution — does not require ``embpred_deploy`` to be importable, so
+    presence checks work in a fresh/unauthenticated environment with no ML stack.
+    """
+    return labeler_models_dir()
 
 
 def rcnn_path() -> str:
