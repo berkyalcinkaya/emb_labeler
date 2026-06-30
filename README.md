@@ -53,7 +53,8 @@ The window is a keyboard-first "cockpit" (dark theme):
   raw/postprocessed, or `⤢` to open the full-size window.
 - **Right rail** — label chips (each shows its hotkey; the model's predicted class is
   outlined in orange), and a **Background tasks** section with a progress bar for each of
-  OCR / Pred / ROI; click a running bar to cancel it.
+  OCR / Pred / ROI (plus **All embryos**). **Click a running bar to pause that task, and
+  click it again to resume** (see [Pausing and resuming](#pausing-and-resuming)).
 
 ### Labeling
 
@@ -110,16 +111,54 @@ still works (center-crop ROIs, no predictions).
 
 ### Automatic background processing
 
-When you select a patient, three tasks start automatically off the UI thread, each shown
+When you open an embryo, three tasks start automatically off the UI thread, each shown
 as a progress bar in the right rail's **Background tasks** section: **OCR**, **Pred**
-(predictions), and **ROI** (RCNN bboxes). A bar is gray when idle, green while
-running/done, and red on error (hover for detail); click a running bar to cancel it.
-Already-current results are skipped (OCR/predictions recompute only when missing or when
-the image set changed; bbox skips frames already cached), and labeling is never blocked.
+(predictions), and **ROI** (RCNN bboxes). A bar is gray when idle/paused, green while
+running/done, and red on error (hover for detail). Already-current results are skipped
+(OCR/predictions recompute only when missing or when the image set changed; bbox skips
+frames already cached), and labeling is never blocked.
+
+**Tasks belong to their embryo, not to the screen.** Each task runs to completion on its
+own; **navigating to another embryo never pauses or cancels it** — it keeps running in
+the background while the bars switch to show the embryo you're now viewing (and switch
+back, mid-progress, when you return). **Every loaded embryo starts computing on its own**
+without waiting for you to open it: a bounded number of other embryos compute alongside
+the one on screen, with the rest starting as those finish. The model (predictions / RCNN)
+is shared and runs one forward pass at a time, and **the on-screen embryo gets priority**
+— background embryos step aside between timepoints so the embryo you're labeling finishes
+first; priority follows the screen as you navigate. The **All embryos** bar shows how many
+embryos are fully done (`done / total`); click it to pause or resume the whole background
+sweep (the on-screen embryo keeps going).
+
+The **ROI** bar advances per timepoint. When a model is loaded, the embryo's bounding box
+is detected once per timepoint *by the prediction task* and reused for every focal depth
+(no duplicate detector runs), so the ROI bar mirrors prediction progress (shown as
+"… via predictions"). With no model loaded, ROI runs as its own detector task.
+
 Predictions default to the model `New-ResNet50-Unfreeze-CE-embSplits-…-3layer256,128,64`;
 if its weights aren't present the **Pred** bar turns red with "weights missing" — fetch it
 (or pick another model) via **Tools ▸ Setup Models**. The Tools menu can also re-trigger
 any of the three on demand.
+
+### Pausing and resuming
+
+The progress-bar widgets are the controls — a click does different things depending on
+the bar's state (the tooltip always tells you which):
+
+- **Running → click to pause.** The task stops and the bar goes gray ("paused N/T"). Work
+  done so far is flushed to the patient's sidecar files, so nothing is lost.
+- **Paused → click again to resume.** *This is how you resume a paused embryo.* The task
+  restarts from where it stopped — it reads the sidecar and skips the timepoints already
+  computed, rather than starting over.
+- **Done ("cached") → click does nothing** (the work is already complete).
+- **Error / "weights missing" → click to retry** (after fixing the cause, e.g. installing
+  weights via **Tools ▸ Setup Models**).
+
+Pausing is the **only** thing that stops a task — it never happens on its own, and a
+paused task stays paused across navigation (switching embryos won't silently resume it).
+The same click-to-pause / click-to-resume applies to the **All embryos** sweep bar.
+Resuming a task is also available from the **Tools** menu (**Run OCR Times**, **Run /
+Re-run Predictions**, **Detect ROIs**), which act on the embryo currently on screen.
 
 ### Tools menu
 
@@ -131,16 +170,19 @@ any of the three on demand.
 - **Run / Re-run Predictions** — runs inference on the 3-depth subset (`F-15, F0, F15`),
   applies monotonic postprocessing, and caches per-timepoint predictions. Re-run
   recomputes; predictions are also flagged when the image set changes.
-- **Detect ROIs (RCNN)** — batch-detects embryo bounding boxes (current depth / the
-  3 inference depths / all depths) and caches them.
+- **Detect ROIs (RCNN)** — computes the embryo bounding box for every timepoint at the
+  reference depth (F0, or the first populated depth) and caches it; the one box is reused
+  across all focal depths. When a model is loaded this defers to predictions (which detect
+  and cache the same boxes).
 - **Timeline** — stage/OCR timeline (x = OCR hours, y = stage). Shows the postprocessed
   sequence (toggle raw argmax), saved labels, and flagged anomalies. Click to jump.
 
 ### ROI detection
 
 `EmbryoLabelingApp.get_ROI()` now uses embpred_deploy's Faster-RCNN (`rcnn.pt`) with a
-center-crop fallback. The ROI view shows an instant center crop and is replaced by the
-detected box once detection finishes for that frame (off the UI thread); boxes are cached
+center-crop fallback. One box per timepoint is detected at the reference depth and reused
+for every focal depth. The ROI view shows an instant center crop and is replaced by the
+detected box once it is available for that timepoint (off the UI thread); boxes are cached
 so revisiting is instant. If detection fails (e.g. missing weights) it is disabled for the
 session and the labeler stays on center crops — install weights via **Tools ▸ Setup
 Models**, then re-run **Tools ▸ Detect ROIs** to retry.

@@ -26,6 +26,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import threading
 import zipfile
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -192,6 +193,9 @@ class PatientTimeSeries:
         # Computed-artifact sidecars are loaded lazily so building a DataSet (which
         # constructs every PatientTimeSeries up front) stays cheap.
         self._rcnn_boxes: Optional[Dict[str, Dict[str, Any]]] = None
+        # Guards the box cache: predictions, the ROI batch task, and on-demand single-frame
+        # detection can all write it from different worker threads.
+        self._rcnn_lock = threading.RLock()
         if load:
             self.load_data()
 
@@ -465,37 +469,46 @@ class PatientTimeSeries:
         Note a computed-but-failed detection is stored as ``null`` and still
         returns True here — callers use ``get_rcnn_box`` to read the value.
         """
-        depth_map = self._ensure_rcnn_boxes_loaded().get(depth_name)
-        return isinstance(depth_map, dict) and str(timepoint) in depth_map
+        with self._rcnn_lock:
+            depth_map = self._ensure_rcnn_boxes_loaded().get(depth_name)
+            return isinstance(depth_map, dict) and str(timepoint) in depth_map
 
     def get_rcnn_box(self, depth_name: str, timepoint: int) -> Optional[List[int]]:
         """Return the cached ``[x1, y1, x2, y2]`` box, or None when detection
         fell back to a center crop (or when nothing is cached yet — guard with
         ``has_rcnn_box`` to distinguish the two)."""
-        depth_map = self._ensure_rcnn_boxes_loaded().get(depth_name)
-        if not isinstance(depth_map, dict):
-            return None
-        value = depth_map.get(str(timepoint))
-        return list(value) if isinstance(value, list) else None
+        with self._rcnn_lock:
+            depth_map = self._ensure_rcnn_boxes_loaded().get(depth_name)
+            if not isinstance(depth_map, dict):
+                return None
+            value = depth_map.get(str(timepoint))
+            return list(value) if isinstance(value, list) else None
 
     def set_rcnn_box(
         self, depth_name: str, timepoint: int, box: Optional[List[int]], save: bool = True
     ) -> None:
-        boxes = self._ensure_rcnn_boxes_loaded()
-        depth_map = boxes.setdefault(depth_name, {})
-        depth_map[str(timepoint)] = [int(v) for v in box] if box is not None else None
-        if save:
-            self.save_rcnn_boxes()
+        with self._rcnn_lock:
+            boxes = self._ensure_rcnn_boxes_loaded()
+            depth_map = boxes.setdefault(depth_name, {})
+            depth_map[str(timepoint)] = [int(v) for v in box] if box is not None else None
+            if save:
+                self.save_rcnn_boxes()
 
     def save_rcnn_boxes(self) -> None:
-        if self._rcnn_boxes is not None:
-            self._write_json_atomic(self.rcnn_boxes_path(), self._rcnn_boxes)
+        # Snapshot under the lock, then write outside it so json.dump can't observe a dict
+        # mutated by a concurrent writer ("changed size during iteration").
+        with self._rcnn_lock:
+            if self._rcnn_boxes is None:
+                return
+            snapshot = {depth: dict(frames) for depth, frames in self._rcnn_boxes.items()}
+        self._write_json_atomic(self.rcnn_boxes_path(), snapshot)
 
     def clear_rcnn_boxes(self) -> None:
         """Drop cached boxes from memory and disk (used when re-detecting)."""
-        self._rcnn_boxes = {}
-        if os.path.exists(self.rcnn_boxes_path()):
-            os.remove(self.rcnn_boxes_path())
+        with self._rcnn_lock:
+            self._rcnn_boxes = {}
+            if os.path.exists(self.rcnn_boxes_path()):
+                os.remove(self.rcnn_boxes_path())
 
     # -------------------------
     # Segmentation masks (pixel-level, per-timepoint, per-stage)

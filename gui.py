@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 from collections import Counter, defaultdict
 from datetime import datetime
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Set, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -184,11 +184,17 @@ def apply_dark_palette(app: QApplication) -> None:
 class TaskProgressBar(QWidget):
     """A labeled progress bar for one background task (OCR / predictions / ROI boxes).
 
-    Lives in the right rail. Exposes the surface the app uses to drive a task —
-    ``start`` wires a :class:`FunctionWorker`'s signals, and ``worker`` reflects the
-    live worker so the app can tell whether a task is running. Idle / running / done /
-    error are conveyed by the bar's fill color and the status text; an errored task
-    (e.g. missing model weights) turns the bar red. Clicking a running bar cancels it.
+    Lives in the right rail and is a *view*: the app owns the per-embryo workers and
+    drives the bar with :meth:`set_running` / :meth:`set_done` / :meth:`set_idle` /
+    :meth:`set_error`. Idle / running / done / error are conveyed by the bar's fill color
+    and status text; an errored task (e.g. missing weights) turns the bar red.
+
+    Clicking invokes the handler set with :meth:`set_click_handler`; the app interprets it
+    for the *current* embryo's task — running → pause, paused/idle → resume, error → retry,
+    done → no-op. Pausing is the only way to stop a task; navigation never does. The
+    tooltip always states what a click will do.
+    (The legacy ``start``/``worker`` path is still used by the dataset-wide prefetch bar,
+    which drives its single worker's progress directly.)
     """
 
     def __init__(self, name: str, parent=None):
@@ -197,6 +203,10 @@ class TaskProgressBar(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(2)
         self._name = name
+        # Single click handler wired by the app. The app owns the (per-embryo) worker and
+        # decides what a click does based on the task's current state, so the bar is just a
+        # view + a click surface. No-op until set.
+        self._click_handler: Optional[Callable[[], None]] = None
 
         head = QHBoxLayout()
         head.setContentsMargins(0, 0, 0, 0)
@@ -233,12 +243,38 @@ class TaskProgressBar(QWidget):
         color = {"error": C_ANOM, "done": C_ACCENT, "running": C_TEXT}.get(state, C_MUTED)
         self.status_label.setStyleSheet(f"color: {color}; font-size: 10px;")
         self.status_label.setText(status)
-        self.setToolTip(f"{self._name}: {tooltip or status}")
+        base = f"{self._name}: {tooltip or status}"
+        hint = self._click_hint(state)
+        self.setToolTip(f"{base}\n({hint})" if hint else base)
+
+    def _click_hint(self, state: str) -> Optional[str]:
+        """What a click will do in ``state`` — surfaced in the tooltip so it's discoverable."""
+        if self._click_handler is None:
+            return None
+        if state == "running":
+            return "click to pause"
+        if state == "done":
+            return None  # complete: clicking is a no-op
+        if state == "error":
+            return "click to retry"
+        return "click to resume"
+
+    def set_click_handler(self, fn: Optional[Callable[[], None]]) -> None:
+        """Set the handler the app runs when this bar is clicked (it decides pause/resume)."""
+        self._click_handler = fn
+
+    def set_running(self, done: int, total: int, status: Optional[str] = None) -> None:
+        """Render a live/running task at ``done/total`` (indeterminate when ``total`` is 0)."""
+        if total > 0:
+            self.bar.setRange(0, total)
+            self.bar.setValue(min(done, total))
+        else:
+            self.bar.setRange(0, 0)
+        self._set_state("running", status if status is not None else f"{done}/{total}")
 
     def mousePressEvent(self, event) -> None:
-        if self.worker is not None:
-            self.cancel()
-            self._set_state("idle", "cancelled")
+        if self._click_handler is not None and self.isEnabled():
+            self._click_handler()
         super().mousePressEvent(event)
 
     # --- worker wiring -------------------------------------------------------
@@ -539,6 +575,11 @@ class EmbryoLabelingApp(QMainWindow):
         self._stage_start: Optional[int] = None
         self._stage_end: Optional[int] = None
 
+        # Per-embryo navigation state (timepoint + focal depth), keyed by patient
+        # directory, so toggling between loaded embryos returns each to where it was
+        # left instead of snapping back to t0 / the default depth.
+        self._patient_view_state: Dict[str, Dict[str, int]] = {}
+
         # Background-work bookkeeping (workers kept alive until they finish).
         self._workers: List[FunctionWorker] = []
         # Append-only: keeps background-task QThreads referenced for their lifetime so
@@ -546,8 +587,21 @@ class EmbryoLabelingApp(QMainWindow):
         self._task_workers: List[FunctionWorker] = []
         self._progress_dialog: Optional[QProgressDialog] = None
         self._roi_worker: Optional[FunctionWorker] = None
-        # Whole-dataset prefetch worker (computes artifacts for non-current embryos).
-        self._prefetch_worker: Optional[FunctionWorker] = None
+        # Background sweep: every loaded embryo's tasks auto-start as their own workers,
+        # but only a bounded number of *non-current* embryos compute at once (the model's
+        # forward pass is globally serialized anyway) so the thread count stays sane. The
+        # current embryo is always allowed to run (labeling-speed priority). The user can
+        # pause the whole background sweep from the "All embryos" bar (sticky).
+        self._bg_paused_all = False
+
+        # Per-(embryo, task) background jobs. A task belongs to its embryo and runs to
+        # completion regardless of which embryo is displayed — the OCR/Pred/ROI bars are
+        # just *views* of the current embryo's tasks. ``_bg_workers`` holds live workers,
+        # ``_bg_progress`` the last (done, total) per key (so a bar restores on return),
+        # and ``_paused`` the keys the user has explicitly paused (sticky across nav).
+        self._bg_workers: Dict[Tuple[str, str], FunctionWorker] = {}
+        self._bg_progress: Dict[Tuple[str, str], Tuple[int, int]] = {}
+        self._paused_tasks: Set[Tuple[str, str]] = set()
         self._pending_roi = None
         self._roi_detect_failed = False
 
@@ -762,8 +816,9 @@ class EmbryoLabelingApp(QMainWindow):
 
         layout.addStretch(1)
 
-        # Background-task progress bars (OCR / predictions / ROI boxes). Auto-started on
-        # patient load; click a running bar to cancel it.
+        # Background-task progress bars for the current embryo (OCR / predictions / ROI
+        # boxes). Auto-started on display and kept running across navigation; click a
+        # running bar to pause it, a paused one to resume. Tasks belong to their embryo.
         tasks_title = QLabel("BACKGROUND TASKS")
         tasks_title.setObjectName("RailTitle")
         layout.addWidget(tasks_title)
@@ -775,10 +830,18 @@ class EmbryoLabelingApp(QMainWindow):
         self.task_prefetch = TaskProgressBar("All embryos")
         for task_bar in (self.task_ocr, self.task_pred, self.task_bbox, self.task_prefetch):
             layout.addWidget(task_bar)
-        # Prefetch only applies to multi-embryo datasets; gray it out until one loads.
+        # Each bar is a view of the *current* embryo's task. Clicking toggles pause/resume
+        # for that (embryo, task) only — running tasks keep running across navigation, and a
+        # paused task stays paused until the user resumes it here. Done bars are no-ops.
+        self.task_ocr.set_click_handler(lambda: self._on_task_bar_clicked("ocr"))
+        self.task_pred.set_click_handler(lambda: self._on_task_bar_clicked("pred"))
+        self.task_bbox.set_click_handler(lambda: self._on_task_bar_clicked("bbox"))
+        self.task_prefetch.set_click_handler(self._on_prefetch_bar_clicked)
+        # The dataset-wide sweep only applies to multi-embryo datasets; gray it out until
+        # more than one embryo is loaded.
         self.task_prefetch.set_disabled(
             "single embryo",
-            tooltip="Prefetch runs only when more than one embryo is loaded.",
+            tooltip="The dataset-wide sweep runs only when more than one embryo is loaded.",
         )
 
         layout.addSpacing(6)
@@ -935,13 +998,14 @@ class EmbryoLabelingApp(QMainWindow):
     def load_dataset(self, directory: str) -> None:
         """Replace the current dataset with the contents of ``directory`` (menu open)."""
         try:
-            self.task_prefetch.cancel()
-            self._prefetch_worker = None
+            self._bg_paused_all = False  # fresh dataset: allow the background sweep again
+            self._patient_view_state.clear()  # replacing the dataset: drop stale view state
+            self._cancel_all_bg_tasks()  # stop the old dataset's per-embryo tasks
             self.dataset = DataSet(directory)
             self.update_patient_list()
             self.ensure_model_ready()
             self.auto_select_first_patient()
-            self.start_prefetch_all_patients()
+            self._schedule_background_work()
             QMessageBox.information(self, "Success", f"Loaded dataset from {directory}")
         except Exception as exc:
             QMessageBox.critical(self, "Error", f"Failed to load dataset from {directory}\n{exc}")
@@ -954,9 +1018,9 @@ class EmbryoLabelingApp(QMainWindow):
         and the user's current patient selection is preserved across the rebuild.
         """
         try:
-            # Stop prefetch so it doesn't race the patient list it's iterating.
-            self.task_prefetch.cancel()
-            self._prefetch_worker = None
+            # New embryos added — resume the sweep so it covers them. Existing embryos'
+            # tasks keep running (we don't cancel them).
+            self._bg_paused_all = False
 
             bootstrap = self.dataset is None
             pending = list(directories)
@@ -971,7 +1035,7 @@ class EmbryoLabelingApp(QMainWindow):
             self.update_patient_list()
             if bootstrap:
                 self.auto_select_first_patient()
-            self.start_prefetch_all_patients()
+            self._schedule_background_work()
 
             total = self.dataset.num_patients()
             if added <= 0:
@@ -1038,9 +1102,12 @@ class EmbryoLabelingApp(QMainWindow):
 
         self.close_all_depths_window()
 
+        # Remember where we were on the embryo we're leaving so returning to it restores
+        # that timepoint/depth instead of snapping back to t0.
+        self._save_current_view_state()
+
         self.current_patient_ts = series[index]
-        self.current_timepoint = 0
-        self.current_depth = self.current_patient_ts.default_depth_index()
+        self._restore_view_state(self.current_patient_ts)
 
         # Reset per-patient assisted-labeling state.
         self._pred_arrays = None
@@ -1050,21 +1117,46 @@ class EmbryoLabelingApp(QMainWindow):
         self._stage_end = None
         self._pending_roi = None
 
-        self.update_nav_indicators()
-        self.display_image()
-
+        # Bind the timeline to the new patient first (it resets to t0), then display the
+        # image — display_image moves the timeline marker to the restored timepoint.
         for widget in self._timeline_widgets():
             widget.set_patient(self.current_patient_ts)
 
         if self.segmentation_window is not None:
             self.segmentation_window.set_patient(self.current_patient_ts)
 
-        # Auto-compute OCR / predictions / ROI boxes in the background (stale or
-        # missing results are recomputed; already-current ones are skipped).
-        self.start_background_tasks(self.current_patient_ts)
-        # Keep the whole-dataset prefetch alive so it keeps filling in the other embryos
-        # (and picks up any patient left uncomputed by a cancelled foreground task).
-        self.start_prefetch_all_patients()
+        self.update_nav_indicators()
+        self.display_image()
+
+        # Bind the bars to this embryo's task state, then pump the background sweep: the
+        # current embryo's tasks (re)start with priority and a bounded set of other embryos
+        # keep computing. Navigation never cancels a running task — tasks belonging to the
+        # embryo we just left keep running in the background.
+        self.refresh_task_bars(self.current_patient_ts)
+        self._schedule_background_work()
+
+    def _save_current_view_state(self) -> None:
+        """Stash the current embryo's timepoint + depth so a later return restores it."""
+        if self.current_patient_ts is not None:
+            self._patient_view_state[self.current_patient_ts.directory] = {
+                "timepoint": self.current_timepoint,
+                "depth": self.current_depth,
+            }
+
+    def _restore_view_state(self, patient_ts) -> None:
+        """Set timepoint/depth to where ``patient_ts`` was last left (else its defaults).
+
+        Saved values are clamped to the patient's current ranges so an image set that
+        changed since the last visit can't push the view out of bounds.
+        """
+        saved = self._patient_view_state.get(patient_ts.directory)
+        if saved is None:
+            self.current_timepoint = 0
+            self.current_depth = patient_ts.default_depth_index()
+            return
+        num_timepoints = patient_ts.num_timepoints()
+        self.current_timepoint = min(max(0, saved["timepoint"]), max(0, num_timepoints - 1))
+        self.current_depth = min(max(0, saved["depth"]), patient_ts.num_depths() - 1)
 
     # ------------------------------------------------------------------
     # Image display and navigation
@@ -1111,48 +1203,69 @@ class EmbryoLabelingApp(QMainWindow):
     def get_ROI(self, image: np.ndarray) -> np.ndarray:
         """Embryo ROI for the current frame.
 
-        Uses the RCNN box cached for this (depth, timepoint) when available, otherwise
-        an instant center crop. Detection itself runs off the UI thread (see
-        ``_schedule_roi_detection``) so scrolling is never blocked.
+        Uses the RCNN box detected at the patient's reference depth (F0 or fallback) for
+        this timepoint, reused for whatever focal depth is shown — the embryo sits at the
+        same position across focal planes. Falls back to an instant center crop until the
+        box exists; detection runs off the UI thread so scrolling is never blocked.
         """
         patient = self.current_patient_ts
         if patient is None:
             return rcnn_roi.center_crop(image)
 
-        depth_name = patient.get_depth_name(self.current_depth)
+        ref_depth = rcnn_roi.reference_depth(patient)
+        if ref_depth is None:
+            return rcnn_roi.center_crop(image)
+
         roi, is_cached = rcnn_roi.roi_for_display(
-            image, patient, depth_name, self.current_timepoint
+            image, patient, ref_depth, self.current_timepoint
         )
-        # Skip per-frame detection while the batch bbox task is running — it writes the
-        # same rcnn_boxes cache, and two writer threads would race.
-        bbox_task_running = self.task_bbox.worker is not None
+        # Skip per-frame detection while a background task that writes this patient's box
+        # cache is running (the prediction or the standalone ROI task), to avoid redundant
+        # detection of frames it will fill in.
+        box_writer_running = (
+            (patient.directory, "bbox") in self._bg_workers
+            or (patient.directory, "pred") in self._bg_workers
+        )
         if (
             not is_cached
             and not self._roi_detect_failed
-            and not bbox_task_running
+            and not box_writer_running
         ):
-            self._schedule_roi_detection(image, depth_name, self.current_timepoint)
+            self._schedule_roi_detection(ref_depth, self.current_timepoint)
         return roi
 
     # ------------------------------------------------------------------
     # Background RCNN ROI detection for the current frame
     # ------------------------------------------------------------------
-    def _schedule_roi_detection(self, image: np.ndarray, depth_name: str, timepoint: int) -> None:
-        """Detect+cache the box for one frame off-thread; only the latest is kept."""
-        request = (image.copy(), depth_name, timepoint)
+    def _schedule_roi_detection(self, depth_name: str, timepoint: int) -> None:
+        """Detect+cache the box for one frame off-thread; only the latest is kept.
+
+        Detection runs the same triplet-based logic as the batch / prediction paths (on a
+        worker thread) so every producer caches an identical box for this timepoint, reused
+        across all focal depths.
+        """
+        patient = self.current_patient_ts
+        if patient is None or depth_name not in patient.depths:
+            return
+        request = (depth_name, timepoint)
         if self._roi_worker is not None and self._roi_worker.isRunning():
             self._pending_roi = request
             return
         self._start_roi_worker(request)
 
     def _start_roi_worker(self, request) -> None:
-        image, depth_name, timepoint = request
+        depth_name, timepoint = request
         patient = self.current_patient_ts
         if patient is None:
             return
+        ref_index = patient.depths.index(depth_name)
 
         def job(progress_cb, message_cb, should_cancel):
-            return rcnn_roi.detect_and_cache_frame(image, patient, depth_name, timepoint)
+            bbox = rcnn_roi.detect_box_for_timepoint(patient, timepoint, ref_index)
+            patient.set_rcnn_box(
+                depth_name, timepoint, list(bbox) if bbox is not None else None, save=True
+            )
+            return bbox
 
         worker = FunctionWorker(job, self)
         self._roi_worker = worker
@@ -1162,10 +1275,10 @@ class EmbryoLabelingApp(QMainWindow):
         worker.start()
 
     def _on_roi_detected(self, depth_name: str, timepoint: int) -> None:
-        # Refresh the ROI view only if the user is still on the detected frame.
+        # Refresh the ROI view if still on the detected timepoint — the box is reused
+        # across depths, so the displayed depth doesn't matter.
         if (
             self.current_patient_ts is not None
-            and self.current_patient_ts.get_depth_name(self.current_depth) == depth_name
             and self.current_timepoint == timepoint
             and self.show_roi_checkbox.isChecked()
         ):
@@ -1688,223 +1801,454 @@ class EmbryoLabelingApp(QMainWindow):
                 setup_models.download_model(
                     model_name, progress_cb=message_cb, should_cancel=should_cancel
                 )
+            # Deliberate re-run with a chosen model: recompute from scratch rather than
+            # resuming whatever a previous model left in the sidecar.
             return predmod.compute_and_save_predictions(
-                patient, model_name, progress_cb=progress_cb, should_cancel=should_cancel
+                patient, model_name, progress_cb=progress_cb, should_cancel=should_cancel, resume=False
             )
 
-        self._launch_task(self.task_pred, patient, job)
+        self._spawn_bg_worker(patient, "pred", job)
 
     # ==================================================================
-    # Background tasks: OCR / predictions / ROI bbox (Phases 2, 3, 4)
+    # Per-(embryo, task) background jobs
     #
-    # Each runs off the UI thread on its own progress bar. They are auto-started on
-    # patient load and can also be (re-)triggered from the Tools menu.
+    # Each embryo owns its OCR / Pred / ROI tasks. A task runs to completion on its own
+    # worker and is NEVER cancelled by navigation — the three bars are views of whichever
+    # embryo is displayed. The only way to stop a task is for the user to click its bar
+    # (pause, sticky). On display, an embryo's not-done / not-paused / not-running tasks
+    # are auto-started; running ones are re-bound to show live progress; paused ones stay
+    # paused. The "All embryos" prefetch fills in embryos the user hasn't opened.
     # ==================================================================
-    def start_background_tasks(self, patient) -> None:
-        """Auto-start OCR / predictions / bbox for ``patient`` (skipping current ones).
+    _TASK_BARS = ("ocr", "pred", "bbox")
+    # Max number of *non-current* embryos computing at once. The model forward pass is
+    # globally serialized, so this mainly bounds the live-thread count; the current embryo
+    # is never counted against it.
+    _BG_MAX_BACKGROUND = 3
+    # Repaint the current embryo's timeline/HUD every this-many computed timepoints (matches
+    # the OCR/prediction sidecar flush cadence) so the chart fills in as a task runs.
+    _TIMELINE_REFRESH_EVERY = 10
 
-        Any tasks still running for a previous patient are cancelled first.
-        """
-        for task_widget in (self.task_ocr, self.task_pred, self.task_bbox):
-            task_widget.cancel()
+    def _bar_for(self, task: str) -> "TaskProgressBar":
+        return {"ocr": self.task_ocr, "pred": self.task_pred, "bbox": self.task_bbox}[task]
 
-        if patient is None or patient.num_timepoints() == 0:
-            for task_widget in (self.task_ocr, self.task_pred, self.task_bbox):
-                task_widget.set_idle()
-            return
+    def _is_current_key(self, key: Tuple[str, str]) -> bool:
+        return self.current_patient_ts is not None and key[0] == self.current_patient_ts.directory
 
-        # OCR
-        if ocr_module.has_ocr_times(patient) and not ocr_module.ocr_stale(patient):
-            self.task_ocr.set_done("cached")
-        else:
-            self._launch_task(
-                self.task_ocr,
-                patient,
-                lambda p, m, c: ocr_module.compute_and_save_ocr_times(patient, progress_cb=p, should_cancel=c),
+    def _model_ready(self) -> bool:
+        """A model is selected and its weights (incl. rcnn.pt) are present locally."""
+        return bool(self.selected_model) and not setup_models.missing_files(self.selected_model)
+
+    def _task_done_count(self, patient, task: str) -> int:
+        """Timepoints already computed for ``task`` against the *current* image set."""
+        if task == "ocr":
+            if ocr_module.ocr_stale(patient):
+                return 0
+            return int((patient.load_ocr_times() or {}).get("processed_timepoints", 0) or 0)
+        if task == "pred":
+            if predmod.predictions_stale(patient):
+                return 0
+            return int((patient.load_prediction_metadata() or {}).get("computed_timepoints", 0) or 0)
+        # bbox: boxes cached at the reference depth
+        ref = rcnn_roi.reference_depth(patient)
+        if ref is None:
+            return 0
+        return sum(1 for t in range(patient.num_timepoints()) if patient.has_rcnn_box(ref, t))
+
+    def _task_complete(self, patient, task: str) -> bool:
+        if task == "ocr":
+            return ocr_module.ocr_complete(patient) and not ocr_module.ocr_stale(patient)
+        if task == "pred":
+            return predmod.predictions_complete(patient) and not predmod.predictions_stale(patient)
+        return not self._patient_needs_bbox(patient)
+
+    def _should_yield_for(self, patient):
+        """A ``should_yield`` predicate for ``patient``'s model task: True while a *different*
+        embryo is on screen and that on-screen embryo has a live model task (predictions or
+        ROI). The on-screen embryo's own task never yields, so it always gets the detector /
+        classifier first; priority follows the screen as the user navigates."""
+        def should_yield() -> bool:
+            cur = self.current_patient_ts
+            if cur is None or cur.directory == patient.directory:
+                return False
+            return (cur.directory, "pred") in self._bg_workers or (cur.directory, "bbox") in self._bg_workers
+        return should_yield
+
+    def _bg_job(self, patient, task: str, resume: bool = True):
+        """The compute callable for ``(patient, task)``, or None if it can't run yet."""
+        if task == "ocr":
+            return lambda p, m, c: ocr_module.compute_and_save_ocr_times(patient, progress_cb=p, should_cancel=c)
+        if task == "pred":
+            if not self._model_ready():
+                return None
+            model = self.selected_model
+            yield_fn = self._should_yield_for(patient)
+            return lambda p, m, c: predmod.compute_and_save_predictions(
+                patient, model, progress_cb=p, should_cancel=c, should_yield=yield_fn, resume=resume
             )
-
-        # Predictions. Cached-and-current wins (no model needed); only flag a missing
-        # model when we'd actually have to compute.
-        model = self.selected_model
-        if patient.has_predictions() and not predmod.predictions_stale(patient):
-            meta = patient.load_prediction_metadata()
-            self.task_pred.set_done("cached", tooltip=f"cached from {meta.get('model_name', '?')}")
-        elif model and setup_models.missing_files(model):
-            self.task_pred.set_error(
-                "weights missing",
-                tooltip=f"'{model}' weights not found — use Tools ▸ Setup Models to download or pick a model.",
+        if task == "bbox":
+            if not setup_models.rcnn_present():
+                return None
+            yield_fn = self._should_yield_for(patient)
+            return lambda p, m, c: rcnn_roi.detect_boxes_for_patient(
+                patient, progress_cb=p, should_cancel=c, should_yield=yield_fn
             )
-        elif model:
-            self._launch_task(
-                self.task_pred,
-                patient,
-                lambda p, m, c: predmod.compute_and_save_predictions(patient, model, progress_cb=p, should_cancel=c),
-            )
-        else:
-            self.task_pred.set_idle("no model")
-
-        # ROI bounding boxes for every populated depth (self-skips already-cached frames).
-        depths = [patient.get_depth_name(i) for i in patient.populated_depth_indices()]
-        self._launch_task(
-            self.task_bbox,
-            patient,
-            lambda p, m, c: rcnn_roi.detect_boxes_for_patient(patient, depths=depths, progress_cb=p, should_cancel=c),
-            on_success=lambda _result: self.refresh_roi_view(),
-        )
-
-    def _launch_task(self, task_widget, patient, job_fn, on_success=None) -> None:
-        worker = FunctionWorker(job_fn, self)
-        self._task_workers.append(worker)  # keep referenced for the worker's lifetime
-
-        def succeeded(result):
-            # Ignore results for a patient the user has since navigated away from.
-            if self.current_patient_ts is patient:
-                self._invalidate_assist_caches()
-                self.update_prediction_label()
-                self.update_label_buttons()
-                for widget in self._timeline_widgets():
-                    widget.refresh()
-                if on_success is not None:
-                    on_success(result)
-
-        task_widget.start(worker, on_success=succeeded)
-
-    # ------------------------------------------------------------------
-    # Whole-dataset prefetch
-    #
-    # The foreground task bars above cover only the *current* embryo. This worker walks
-    # every other loaded embryo and computes any missing OCR / predictions / ROI boxes,
-    # so navigating to a new embryo finds its results already cached. It runs on a single
-    # background thread, re-scans each pass (to pick up embryos a cancelled foreground
-    # task left uncomputed), and always skips whichever embryo is currently displayed so
-    # it never double-computes against the foreground tasks.
-    # ------------------------------------------------------------------
-    def _current_prefetch_model(self) -> Optional[str]:
-        """The active model name if its weights are present locally, else None.
-
-        Predictions and ROI detection need weights (rcnn.pt ships with the model); OCR
-        does not. Returning None disables the model-dependent prefetch steps while still
-        allowing OCR to run.
-        """
-        name = self.selected_model
-        if name and not setup_models.missing_files(name):
-            return name
         return None
 
+    def _start_bg_task(self, patient, task: str, resume: bool = True) -> bool:
+        """Start a worker for ``(patient, task)`` unless one is already live. Returns True
+        if a worker is now running for it. Clears any paused flag (an explicit resume)."""
+        key = (patient.directory, task)
+        if key in self._bg_workers:
+            return True
+        job = self._bg_job(patient, task, resume=resume)
+        if job is None:
+            return False
+        self._spawn_bg_worker(patient, task, job)
+        return True
+
+    def _spawn_bg_worker(self, patient, task: str, job) -> None:
+        """Register, wire, and start a background worker for ``(patient, task)``.
+
+        Any worker already running for the key is cancelled first (a deliberate re-run,
+        e.g. choosing a new model). The three bars are updated only when ``patient`` is the
+        one on screen; otherwise the work proceeds invisibly and the bar reflects it on
+        return."""
+        key = (patient.directory, task)
+        existing = self._bg_workers.pop(key, None)
+        if existing is not None:
+            try:
+                existing.cancel()
+            except RuntimeError:
+                pass
+            for sig in (existing.progress, existing.message, existing.succeeded, existing.failed):
+                try:
+                    sig.disconnect()
+                except (TypeError, RuntimeError):
+                    pass
+        self._paused_tasks.discard(key)
+        worker = FunctionWorker(job, self)
+        self._bg_workers[key] = worker
+        self._task_workers.append(worker)  # keep referenced + cancelled on close
+        self._bg_progress[key] = (self._task_done_count(patient, task), patient.num_timepoints())
+        worker.progress.connect(lambda d, t, k=key: self._on_bg_progress(k, d, t))
+        worker.message.connect(lambda msg, k=key: self._on_bg_message(k, msg))
+        worker.succeeded.connect(lambda r, k=key, p=patient: self._on_bg_succeeded(k, p))
+        worker.failed.connect(lambda e, k=key, p=patient: self._on_bg_failed(k, p, e))
+        worker.start()
+        if self._is_current_key(key):
+            done, total = self._bg_progress[key]
+            self._bar_for(task).set_running(done, total, "starting…")
+            if task == "pred":
+                self._render_roi_bar(patient)
+
+    def _pause_bg_task(self, patient, task: str) -> None:
+        """User pause: stop the worker (it flushes partial progress) and mark it sticky.
+        Signals are disconnected so the worker's imminent completion can't flip the bar."""
+        key = (patient.directory, task)
+        worker = self._bg_workers.pop(key, None)
+        if worker is not None:
+            try:
+                worker.cancel()
+            except RuntimeError:
+                pass
+            for sig in (worker.progress, worker.message, worker.succeeded, worker.failed):
+                try:
+                    sig.disconnect()
+                except (TypeError, RuntimeError):
+                    pass
+        self._paused_tasks.add(key)
+        if self._is_current_key(key):
+            done = self._task_done_count(patient, task)
+            self._bar_for(task).set_idle(f"paused {done}/{patient.num_timepoints()}")
+            if task == "pred":
+                self._render_roi_bar(patient)
+
+    def autostart_tasks(self, patient) -> None:
+        """Auto-start an embryo's not-done / not-paused / not-running tasks (called on
+        load/display). Never cancels anything; running tasks for *other* embryos keep going."""
+        if patient is None or patient.num_timepoints() == 0:
+            return
+        for task in ("ocr", "pred"):
+            key = (patient.directory, task)
+            if key in self._bg_workers or key in self._paused_tasks or self._task_complete(patient, task):
+                continue
+            self._start_bg_task(patient, task)
+        # ROI: predictions produce the boxes when a model is ready; only run the standalone
+        # detector when no model is available (so there's never duplicate RCNN work).
+        if not self._model_ready():
+            key = (patient.directory, "bbox")
+            if not (key in self._bg_workers or key in self._paused_tasks or self._task_complete(patient, "bbox")):
+                self._start_bg_task(patient, "bbox")
+
+    def refresh_task_bars(self, patient) -> None:
+        """Bind the three bars to ``patient``'s current task state (no side effects on
+        workers). Auto-start is done separately by :meth:`autostart_tasks`."""
+        if patient is None or patient.num_timepoints() == 0:
+            for task in self._TASK_BARS:
+                self._bar_for(task).set_idle()
+            return
+        self._render_task_bar(patient, "ocr")
+        self._render_task_bar(patient, "pred")
+        self._render_roi_bar(patient)
+
+    def _render_task_bar(self, patient, task: str) -> None:
+        """Render the OCR or Pred bar from ``patient``'s state."""
+        bar = self._bar_for(task)
+        key = (patient.directory, task)
+        total = patient.num_timepoints()
+        if self._task_complete(patient, task):
+            tip = None
+            if task == "pred":
+                tip = f"cached from {patient.load_prediction_metadata().get('model_name', '?')}"
+            bar.set_done("cached", tooltip=tip)
+            return
+        if key in self._bg_workers:
+            done, tot = self._bg_progress.get(key, (self._task_done_count(patient, task), total))
+            bar.set_running(done, tot, f"{done}/{tot}")
+            return
+        if key in self._paused_tasks:
+            bar.set_idle(f"paused {self._task_done_count(patient, task)}/{total}")
+            return
+        if task == "pred" and not self.selected_model:
+            bar.set_idle("no model")
+        elif task == "pred" and setup_models.missing_files(self.selected_model):
+            bar.set_error(
+                "weights missing",
+                tooltip=f"'{self.selected_model}' weights not found — use Tools ▸ Setup Models.",
+            )
+        else:
+            # Runnable but no live worker (e.g. transiently between display and autostart).
+            bar.set_idle(f"idle {self._task_done_count(patient, task)}/{total}")
+
+    def _render_roi_bar(self, patient) -> None:
+        """Render the ROI bar. When a model is ready, boxes are produced by predictions, so
+        the bar *mirrors* the prediction task (advancing per timepoint); otherwise it's a
+        standalone detector task with its own worker."""
+        total = patient.num_timepoints()
+        if self._task_complete(patient, "bbox"):
+            self.task_bbox.set_done("cached")
+            return
+        if self._model_ready():
+            # Boxes come from predictions — mirror their state so ROI advances per timepoint.
+            pred_key = (patient.directory, "pred")
+            done = self._task_done_count(patient, "bbox")
+            if pred_key in self._bg_workers:
+                self.task_bbox.set_running(done, total, f"{done}/{total} via predictions")
+            elif pred_key in self._paused_tasks:
+                self.task_bbox.set_idle(f"paused {done}/{total} (via predictions)")
+            else:
+                self.task_bbox.set_running(done, total, f"{done}/{total} via predictions")
+            return
+        if not setup_models.rcnn_present():
+            self.task_bbox.set_idle("no detector")
+            return
+        self._render_task_bar_bbox_standalone(patient)
+
+    def _render_task_bar_bbox_standalone(self, patient) -> None:
+        key = (patient.directory, "bbox")
+        total = patient.num_timepoints()
+        done = self._task_done_count(patient, "bbox")
+        if key in self._bg_workers:
+            d, t = self._bg_progress.get(key, (done, total))
+            self.task_bbox.set_running(d, t, f"{d}/{t}")
+        elif key in self._paused_tasks:
+            self.task_bbox.set_idle(f"paused {done}/{total}")
+        else:
+            self.task_bbox.set_idle(f"idle {done}/{total}")
+
+    def _refresh_current_assist_views(self) -> None:
+        """Re-read the current embryo's OCR/prediction sidecars and repaint the HUD +
+        timeline. Used both on task completion and (throttled) as a task fills in."""
+        self._invalidate_assist_caches()
+        self.update_prediction_label()
+        self.update_label_buttons()
+        for widget in self._timeline_widgets():
+            widget.refresh()
+
+    # --- worker signal handlers (run on the UI thread) -----------------
+    def _on_bg_progress(self, key, done: int, total: int) -> None:
+        self._bg_progress[key] = (done, total)
+        if not self._is_current_key(key):
+            return
+        self._bar_for(key[1]).set_running(done, total, f"{done}/{total}")
+        if key[1] == "pred" and self._model_ready():
+            # ROI mirrors predictions: each scored timepoint caches a box. (When the run
+            # finishes, _on_bg_succeeded → refresh_task_bars flips the ROI bar to cached.)
+            self.task_bbox.set_running(done, total, f"{done}/{total} via predictions")
+        # Semi-live: OCR/predictions flush new timepoints to disk every flush interval, so
+        # repaint the timeline/HUD at those boundaries (not every tick — matplotlib redraws
+        # aren't free) to watch the chart fill in. Completion does a final repaint.
+        if key[1] in ("ocr", "pred") and done % self._TIMELINE_REFRESH_EVERY == 0 and done < total:
+            self._refresh_current_assist_views()
+
+    def _on_bg_message(self, key, msg: str) -> None:
+        if self._is_current_key(key):
+            self._bar_for(key[1])._set_state("running", msg, tooltip=msg)
+
+    def _on_bg_succeeded(self, key, patient) -> None:
+        self._bg_workers.pop(key, None)
+        if self._is_current_key(key):
+            self._refresh_current_assist_views()
+            if key[1] in ("pred", "bbox"):
+                self.refresh_roi_view()
+            self.refresh_task_bars(patient)
+        # A slot freed (or this embryo finished) → start the next pending background embryo.
+        self._schedule_background_work()
+
+    def _on_bg_failed(self, key, patient, error: str) -> None:
+        self._bg_workers.pop(key, None)
+        if key[1] == "bbox":
+            self._roi_detect_failed = True
+        if self._is_current_key(key):
+            self._bar_for(key[1]).set_error("error", tooltip=error)
+        self._schedule_background_work()
+
+    # --- bar click handling --------------------------------------------
+    def _on_task_bar_clicked(self, task: str) -> None:
+        patient = self.current_patient_ts
+        if patient is None or patient.num_timepoints() == 0:
+            return
+        # ROI in "via predictions" mode isn't an independent task — manage it via Pred.
+        if task == "bbox" and self._model_ready() and not self._task_complete(patient, "bbox"):
+            return
+        key = (patient.directory, task)
+        if self._task_complete(patient, task):
+            return  # done → no-op
+        if key in self._bg_workers:
+            self._pause_bg_task(patient, task)
+            return
+        # paused / idle → resume; surface guidance if it can't run.
+        if self._bg_job(patient, task) is None:
+            if task == "pred":
+                if self._ensure_model_selected() is not None:
+                    self._start_bg_task(patient, "pred")
+            else:
+                QMessageBox.information(
+                    self, "No detector",
+                    "The RCNN detector (rcnn.pt) isn't installed — use Tools ▸ Setup Models.",
+                )
+            return
+        self._start_bg_task(patient, task)
+
     def _patient_needs_bbox(self, patient) -> bool:
-        for depth_index in patient.populated_depth_indices():
-            depth_name = patient.get_depth_name(depth_index)
-            for timepoint in range(patient.num_timepoints()):
-                if not patient.has_rcnn_box(depth_name, timepoint):
-                    return True
+        depth_name = rcnn_roi.reference_depth(patient)
+        if depth_name is None:
+            return False
+        for timepoint in range(patient.num_timepoints()):
+            if not patient.has_rcnn_box(depth_name, timepoint):
+                return True
         return False
 
-    def _patient_needs_prefetch(self, patient, model_name: Optional[str]) -> bool:
+    # ------------------------------------------------------------------
+    # Background sweep over the whole dataset
+    #
+    # Every loaded embryo's tasks auto-start as their own per-embryo workers (same
+    # mechanism as the current embryo), so an embryo doesn't wait until you open it. The
+    # current embryo always runs; a bounded number of *other* embryos run alongside it
+    # (``_BG_MAX_BACKGROUND``) and the rest start as those finish (``_schedule_background_work``
+    # is re-pumped on every task completion). The "All embryos" bar shows how many embryos
+    # are fully done and pauses/resumes the whole background sweep.
+    # ------------------------------------------------------------------
+    def _embryo_needs_work(self, patient) -> bool:
+        """True if ``patient`` has a runnable, not-complete, not-user-paused task."""
         if patient.num_timepoints() == 0:
             return False
-        if not (ocr_module.has_ocr_times(patient) and not ocr_module.ocr_stale(patient)):
+        for task in self._TASK_BARS:
+            if task == "pred" and not self._model_ready():
+                continue          # predictions need a model
+            if task == "bbox" and self._model_ready():
+                continue          # boxes come from predictions when a model is present
+            key = (patient.directory, task)
+            if key in self._paused_tasks or self._task_complete(patient, task):
+                continue
             return True
-        if model_name:
-            if not patient.has_predictions() or predmod.predictions_stale(patient):
-                return True
-            if self._patient_needs_bbox(patient):
-                return True
         return False
 
-    def start_prefetch_all_patients(self) -> None:
-        """(Re)start the background prefetch over all loaded embryos.
+    def _schedule_background_work(self) -> None:
+        """Keep the current embryo computing and roll a bounded set of other embryos.
 
-        No-ops if a prefetch worker is already running — it re-scans each pass, so it
-        will pick up any newly-needed embryo on its own. Otherwise a fresh worker starts
-        (covering gaps left after a previous worker finished).
-        """
+        Called on load, navigation, and whenever a task finishes (to fill a freed slot).
+        Never cancels anything; honours per-task pauses and the dataset-wide pause."""
+        if self.dataset is None:
+            return
+        if self.current_patient_ts is not None:
+            self.autostart_tasks(self.current_patient_ts)  # current: always (priority)
+        if not self._bg_paused_all:
+            current_dir = self.current_patient_ts.directory if self.current_patient_ts else None
+            active_other = {key[0] for key in self._bg_workers if key[0] != current_dir}
+            for patient in self.dataset.get_patient_series():
+                if len(active_other) >= self._BG_MAX_BACKGROUND:
+                    break
+                if patient.directory == current_dir or patient.directory in active_other:
+                    continue
+                if not self._embryo_needs_work(patient):
+                    continue
+                self.autostart_tasks(patient)
+                active_other.add(patient.directory)
+        self._update_all_embryos_bar()
+
+    def _update_all_embryos_bar(self) -> None:
+        """Render the "All embryos" bar: embryos fully done / total (or paused / disabled)."""
         if self.dataset is None or self.dataset.num_patients() <= 1:
-            # Nothing to prefetch with a single embryo — gray the bar out and say why.
             self.task_prefetch.set_disabled(
                 "single embryo",
-                tooltip="Prefetch runs only when more than one embryo is loaded.",
+                tooltip="The dataset-wide sweep runs only when more than one embryo is loaded.",
             )
             return
-        if self._prefetch_worker is not None and self._prefetch_worker.isRunning():
+        patients = [p for p in self.dataset.get_patient_series() if p.num_timepoints() > 0]
+        total = len(patients)
+        done = sum(1 for p in patients if not self._embryo_needs_work(p))
+        if self._bg_paused_all:
+            self.task_prefetch.set_idle(f"paused {done}/{total}")
+        elif done >= total:
+            self.task_prefetch.set_done(f"{total}/{total} embryos")
+        else:
+            self.task_prefetch.set_running(done, total, f"{done}/{total} embryos")
+
+    def _on_prefetch_bar_clicked(self) -> None:
+        """Toggle the dataset-wide background sweep: pause it (stopping non-current
+        embryos' workers) or resume it. The current embryo always keeps computing."""
+        self._bg_paused_all = not self._bg_paused_all
+        if self._bg_paused_all:
+            current_dir = self.current_patient_ts.directory if self.current_patient_ts else None
+            for key in list(self._bg_workers):
+                if key[0] != current_dir:
+                    self._cancel_bg_worker(key)  # flushed + resumable; not marked paused
+        self._schedule_background_work()
+
+    def _cancel_bg_worker(self, key) -> None:
+        """Stop and unwire the worker for ``key`` (no pause flag). It flushes partial
+        progress to its sidecar, so a later start resumes from where it stopped."""
+        worker = self._bg_workers.pop(key, None)
+        if worker is None:
             return
-        worker = FunctionWorker(self._prefetch_job, self)
-        self._prefetch_worker = worker
-        self._task_workers.append(worker)  # keep referenced + cancelled on close
-        self.task_prefetch.start(worker, on_success=self._on_prefetch_done)
+        try:
+            worker.cancel()
+        except RuntimeError:
+            pass
+        for sig in (worker.progress, worker.message, worker.succeeded, worker.failed):
+            try:
+                sig.disconnect()
+            except (TypeError, RuntimeError):
+                pass
 
-    def _on_prefetch_done(self, _result) -> None:
-        self._prefetch_worker = None
+    def _cancel_bg_task(self, patient, task: str) -> None:
+        """Stop a worker for ``(patient, task)`` without marking it paused (used when one
+        task takes over another's work, e.g. predictions taking over ROI box production)."""
+        self._cancel_bg_worker((patient.directory, task))
 
-    def _prefetch_job(self, progress_cb, message_cb, should_cancel):
-        """Worker body: compute missing artifacts for every non-current embryo.
-
-        Runs off the UI thread. ``attempted`` (keyed by object id) bounds the work to one
-        attempt per embryo so a repeatedly-failing compute can't spin forever; the worker
-        is restarted on dataset load / navigation, which clears it to retry later.
-        """
-        dataset = self.dataset
-        if dataset is None:
-            return
-        model_name = self._current_prefetch_model()
-        attempted: set = set()
-        while not should_cancel():
-            patients = [p for p in dataset.get_patient_series() if p.num_timepoints() > 0]
-            total = len(patients)
-            current = self.current_patient_ts
-            pending = [
-                p
-                for p in patients
-                if id(p) not in attempted
-                and p is not current
-                and self._patient_needs_prefetch(p, model_name)
-            ]
-            progress_cb(total - len(pending), total)
-            if not pending:
-                break
-            patient = pending[0]
-            attempted.add(id(patient))
-            message_cb(os.path.basename(patient.directory))
-
-            # Re-check `is current` before each step: the user may have navigated to this
-            # embryo, in which case the foreground tasks own it — leave it to them.
-            def claimable() -> bool:
-                return not should_cancel() and patient is not self.current_patient_ts
-
-            if claimable() and not (
-                ocr_module.has_ocr_times(patient) and not ocr_module.ocr_stale(patient)
-            ):
-                try:
-                    ocr_module.compute_and_save_ocr_times(patient, should_cancel=should_cancel)
-                except Exception:
-                    pass
-            if model_name and claimable() and (
-                not patient.has_predictions() or predmod.predictions_stale(patient)
-            ):
-                try:
-                    predmod.compute_and_save_predictions(
-                        patient, model_name, should_cancel=should_cancel
-                    )
-                except Exception:
-                    pass
-            if model_name and claimable() and self._patient_needs_bbox(patient):
-                depths = [patient.get_depth_name(i) for i in patient.populated_depth_indices()]
-                try:
-                    rcnn_roi.detect_boxes_for_patient(
-                        patient, depths=depths, should_cancel=should_cancel
-                    )
-                except Exception:
-                    pass
+    def _cancel_all_bg_tasks(self) -> None:
+        """Cancel every per-embryo worker and clear task state (used on dataset replace)."""
+        for key in list(self._bg_workers):
+            self._cancel_bg_worker(key)
+        self._bg_progress.clear()
+        self._paused_tasks.clear()
 
     def run_ocr(self) -> None:
         if self.current_patient_ts is None:
             QMessageBox.warning(self, "No patient selected", "Select a patient first.")
             return
-        patient = self.current_patient_ts
-        self._launch_task(
-            self.task_ocr,
-            patient,
-            lambda p, m, c: ocr_module.compute_and_save_ocr_times(patient, progress_cb=p, should_cancel=c),
-        )
+        self._start_bg_task(self.current_patient_ts, "ocr")
 
     def run_predictions(self, force: bool = False) -> None:
         if self.current_patient_ts is None:
@@ -1912,7 +2256,7 @@ class EmbryoLabelingApp(QMainWindow):
             return
         patient = self.current_patient_ts
 
-        if not force and patient.has_predictions() and not predmod.predictions_stale(patient):
+        if not force and predmod.predictions_complete(patient) and not predmod.predictions_stale(patient):
             self.task_pred.set_done("cached")
             self._invalidate_assist_caches()
             self.update_prediction_label()
@@ -1924,38 +2268,40 @@ class EmbryoLabelingApp(QMainWindow):
         model_name = self._ensure_model_selected()
         if model_name is None:
             return
-        self._launch_task(
-            self.task_pred,
-            patient,
-            lambda p, m, c: predmod.compute_and_save_predictions(patient, model_name, progress_cb=p, should_cancel=c),
-        )
+        # Predictions detect + cache the ROI box per timepoint, so stand down any standalone
+        # ROI detector (the ROI bar then mirrors predictions). ``force`` recomputes from
+        # scratch (a fresh worker); otherwise resume/start the sidecar-backed run.
+        self._cancel_bg_task(patient, "bbox")
+        if force:
+            self._spawn_bg_worker(
+                patient, "pred",
+                lambda p, m, c: predmod.compute_and_save_predictions(
+                    patient, model_name, progress_cb=p, should_cancel=c, resume=False
+                ),
+            )
+        else:
+            self._start_bg_task(patient, "pred")
 
     def detect_rois(self) -> None:
+        """Compute RCNN ROI boxes for the current embryo (resumable; the one box per
+        timepoint is reused across every focal depth). When a model is available the boxes
+        come from predictions, so this starts/uses that; otherwise it runs the detector."""
         if self.current_patient_ts is None:
             QMessageBox.warning(self, "No patient selected", "Select a patient first.")
             return
         patient = self.current_patient_ts
 
-        populated = [patient.get_depth_name(i) for i in patient.populated_depth_indices()]
-        options = {
-            "Current depth only": [patient.get_depth_name(self.current_depth)],
-            "Inference depths (F-15, F0, F15)": list(predmod.eb.INFERENCE_DEPTHS),
-            "Populated depths": populated,
-            "All depths": list(patient.depths),
-        }
-        choice, ok = QInputDialog.getItem(
-            self, "Detect ROIs", "Detect RCNN boxes for:", list(options.keys()), 2, False
-        )
-        if not ok:
+        if rcnn_roi.reference_depth(patient) is None:
+            QMessageBox.warning(
+                self, "No images", "This embryo has no focal-depth images to detect on."
+            )
             return
-        depths = options[choice]
         self._roi_detect_failed = False
-        self._launch_task(
-            self.task_bbox,
-            patient,
-            lambda p, m, c: rcnn_roi.detect_boxes_for_patient(patient, depths=depths, progress_cb=p, should_cancel=c),
-            on_success=lambda _result: self.refresh_roi_view(),
-        )
+        if self._model_ready():
+            # Boxes are produced by predictions (no separate detector) — start them.
+            self.run_predictions()
+            return
+        self._start_bg_task(patient, "bbox")
 
     # ==================================================================
     # Assist data caches + status label

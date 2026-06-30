@@ -119,69 +119,190 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def _usable_depths(patient_ts, reference_depths: Sequence[str]) -> List[str]:
+    """The reference depths that actually exist (with images) for this patient."""
+    return [
+        d
+        for d in reference_depths
+        if d in patient_ts.depths and patient_ts.image_paths[patient_ts.depths.index(d)]
+    ]
+
+
+def _ocr_one_timepoint(patient_ts, timepoint: int, usable_depths: Sequence[str]) -> Tuple[Optional[float], Optional[str]]:
+    """OCR a single timepoint, trying each depth in order. Returns ``(hours, depth)``."""
+    for depth_name in usable_depths:
+        depth_index = patient_ts.depths.index(depth_name)
+        try:
+            image = patient_ts.get_image(timepoint, depth_index)
+        except (IndexError, OSError):
+            continue
+        value = extract_hours_from_image(image)
+        if value is not None:
+            return value, depth_name
+    return None, None
+
+
 def extract_hours_for_patient(
     patient_ts,
     reference_depths: Optional[Sequence[str]] = None,
     progress_cb: Optional[Callable[[int, int], None]] = None,
     should_cancel: Optional[Callable[[], bool]] = None,
 ) -> Dict[str, Any]:
-    """OCR every timepoint and return the ``ocr_times.json`` payload.
+    """OCR every timepoint and return the ``ocr_times.json`` payload (no persistence).
 
     Tries each depth in ``reference_depths`` order per timepoint until one yields a
-    number, then linearly interpolates the gaps. Does not persist — see
-    :func:`compute_and_save_ocr_times`.
+    number, then linearly interpolates the gaps. See :func:`compute_and_save_ocr_times`
+    for the durable, resumable variant used by the GUI.
     """
     depths = list(reference_depths) if reference_depths else DEFAULT_REFERENCE_DEPTHS
-    usable_depths = [d for d in depths if d in patient_ts.depths and patient_ts.image_paths[patient_ts.depths.index(d)]]
+    usable_depths = _usable_depths(patient_ts, depths)
     num_timepoints = patient_ts.num_timepoints()
 
-    raw_hours: List[Optional[float]] = [None] * num_timepoints
+    raw_hours: Dict[int, Optional[float]] = {}
     depth_used: Dict[str, str] = {}
-
     for timepoint in range(num_timepoints):
         if should_cancel is not None and should_cancel():
             break
-        for depth_name in usable_depths:
-            depth_index = patient_ts.depths.index(depth_name)
-            try:
-                image = patient_ts.get_image(timepoint, depth_index)
-            except (IndexError, OSError):
-                continue
-            value = extract_hours_from_image(image)
-            if value is not None:
-                raw_hours[timepoint] = value
-                depth_used[str(timepoint)] = depth_name
-                break
+        value, depth_name = _ocr_one_timepoint(patient_ts, timepoint, usable_depths)
+        raw_hours[timepoint] = value
+        if depth_name is not None:
+            depth_used[str(timepoint)] = depth_name
         if progress_cb is not None:
             progress_cb(timepoint + 1, num_timepoints)
 
-    filled, interpolated = _interpolate(raw_hours)
+    return _build_ocr_payload(
+        raw_hours, depth_used, num_timepoints, depths, patient_ts.image_fingerprint()
+    )
 
+
+# --------------------------------------------------------------------------------------
+# Durable, resumable compute + persist.
+#
+# OCR is persisted to ``ocr_times.json`` every ``OCR_FLUSH_EVERY`` timepoints (and once
+# at the end), and a restarted run *resumes* from whatever is already persisted for the
+# same image set: timepoints already OCR'd (including ones that failed and were recorded
+# as ``null``) are skipped. So toggling embryos mid-run — or the app closing — never
+# discards progress.
+# --------------------------------------------------------------------------------------
+OCR_FLUSH_EVERY = 10
+
+
+def _build_ocr_payload(
+    raw_hours: Dict[int, Optional[float]],
+    depth_used: Dict[str, str],
+    num_timepoints: int,
+    reference_depths: Sequence[str],
+    fingerprint: Any,
+) -> Dict[str, Any]:
+    """Build the sidecar payload from the timepoints OCR'd so far.
+
+    ``hours`` is interpolated across the full range (yet-to-be-processed timepoints read
+    as gaps and refine as the run continues); ``raw_hours`` holds only processed
+    timepoints so a resume can tell them apart from un-attempted ones.
+    """
+    raw_list = [raw_hours.get(i) for i in range(num_timepoints)]
+    filled, interpolated = _interpolate(raw_list)
     return {
         "hours": {str(i): filled[i] for i in range(num_timepoints)},
-        "raw_hours": {str(i): raw_hours[i] for i in range(num_timepoints)},
+        "raw_hours": {str(i): raw_hours[i] for i in sorted(raw_hours)},
         "interpolated": [str(i) for i in interpolated],
-        "reference_depths": depths,
+        "reference_depths": list(reference_depths),
         "depth_used": depth_used,
         "timestamp": _now_iso(),
-        "image_fingerprint": patient_ts.image_fingerprint(),
+        "image_fingerprint": fingerprint,
+        "num_timepoints": num_timepoints,
+        "processed_timepoints": len(raw_hours),
+        "complete": len(raw_hours) >= num_timepoints and num_timepoints > 0,
     }
 
 
-def compute_and_save_ocr_times(patient_ts, should_cancel=None, **kwargs) -> Dict[str, Any]:
-    """Run OCR for the patient and persist ``ocr_times.json``.
+def _load_resumable_ocr(patient_ts, fingerprint: Any) -> Tuple[Dict[int, Optional[float]], Dict[str, str]]:
+    """Per-timepoint OCR results already persisted for *this* image set.
 
-    Returns ``{}`` without saving if cancelled mid-run.
+    Returns ``({}, {})`` when nothing reusable exists (no file, or a different image
+    set), forcing a fresh OCR pass.
     """
-    ocr_times = extract_hours_for_patient(patient_ts, should_cancel=should_cancel, **kwargs)
-    if should_cancel is not None and should_cancel():
-        return {}
-    patient_ts.save_ocr_times(ocr_times)
-    return ocr_times
+    data = patient_ts.load_ocr_times()
+    if not data or data.get("image_fingerprint") != fingerprint:
+        return {}, {}
+    raw_hours: Dict[int, Optional[float]] = {
+        int(key): value for key, value in (data.get("raw_hours") or {}).items()
+    }
+    depth_used: Dict[str, str] = dict(data.get("depth_used") or {})
+    return raw_hours, depth_used
+
+
+def compute_and_save_ocr_times(
+    patient_ts,
+    reference_depths: Optional[Sequence[str]] = None,
+    progress_cb: Optional[Callable[[int, int], None]] = None,
+    should_cancel: Optional[Callable[[], bool]] = None,
+    resume: bool = True,
+) -> Dict[str, Any]:
+    """Run OCR for the patient, persisting ``ocr_times.json`` incrementally.
+
+    Continues from any results already persisted for the same image set when ``resume``
+    is True (default); pass ``resume=False`` to force a fresh pass.
+    """
+    reference = list(reference_depths) if reference_depths else DEFAULT_REFERENCE_DEPTHS
+    usable_depths = _usable_depths(patient_ts, reference)
+    num_timepoints = patient_ts.num_timepoints()
+    fingerprint = patient_ts.image_fingerprint()
+
+    raw_hours, depth_used = _load_resumable_ocr(patient_ts, fingerprint) if resume else ({}, {})
+    if progress_cb is not None:
+        progress_cb(len(raw_hours), num_timepoints)
+
+    def persist() -> Dict[str, Any]:
+        return _build_ocr_payload(raw_hours, depth_used, num_timepoints, reference, fingerprint)
+
+    if num_timepoints > 0 and len(raw_hours) >= num_timepoints:
+        payload = persist()
+        patient_ts.save_ocr_times(payload)
+        return payload
+
+    flushed_count = len(raw_hours)
+    for timepoint in range(num_timepoints):
+        if timepoint in raw_hours:
+            continue
+        if should_cancel is not None and should_cancel():
+            break
+        value, depth_name = _ocr_one_timepoint(patient_ts, timepoint, usable_depths)
+        raw_hours[timepoint] = value
+        if depth_name is not None:
+            depth_used[str(timepoint)] = depth_name
+        if len(raw_hours) - flushed_count >= OCR_FLUSH_EVERY:
+            patient_ts.save_ocr_times(persist())
+            flushed_count = len(raw_hours)
+        if progress_cb is not None:
+            progress_cb(len(raw_hours), num_timepoints)
+
+    # Persist whatever was OCR'd, even if cancelled part-way; an immediate cancel with
+    # nothing processed leaves the sidecar untouched.
+    if not raw_hours:
+        return patient_ts.load_ocr_times()
+    payload = persist()
+    patient_ts.save_ocr_times(payload)
+    return payload
 
 
 def has_ocr_times(patient_ts) -> bool:
     return bool(patient_ts.load_ocr_times())
+
+
+def ocr_complete(patient_ts) -> bool:
+    """True only when every timepoint has been OCR'd and persisted.
+
+    A partial sidecar (an interrupted/resumable run) returns False so callers re-launch
+    the worker to resume. Legacy sidecars without the ``complete`` flag are treated as
+    complete when they carry hours.
+    """
+    data = patient_ts.load_ocr_times()
+    if not data:
+        return False
+    if "complete" in data:
+        return bool(data["complete"])
+    return bool(data.get("hours"))
 
 
 def ocr_stale(patient_ts) -> bool:

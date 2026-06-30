@@ -33,6 +33,7 @@ from typing import Any, Callable, Dict, List, Optional
 import numpy as np
 
 import embpred_backend as eb
+import rcnn_roi  # reference_depth + shared ROI-box cache (one-directional import; no cycle)
 
 # Explicit deploy-name -> labeler-name overrides. Empty today because the names match
 # 1:1; add an entry here if embpred ever renames/merges a class relative to the labeler.
@@ -81,54 +82,77 @@ def _inference_triplet_paths(patient_ts) -> List[tuple]:
 
 # --------------------------------------------------------------------------------------
 # Compute + persist.
+#
+# Predictions are written to the sidecars *incrementally* (every ``PRED_FLUSH_EVERY``
+# timepoints and once more at the end), and computation *resumes* from whatever is
+# already persisted for the same image set + model. So a run interrupted by the user
+# toggling embryos — or the app closing — is never lost: restarting the worker reads the
+# sidecar and continues from the first un-scored timepoint instead of from scratch.
 # --------------------------------------------------------------------------------------
-def compute_and_save_predictions(
-    patient_ts,
-    model_name: str,
-    use_gpu: Optional[bool] = None,
-    progress_cb: Optional[Callable[[int, int], None]] = None,
-    should_cancel: Optional[Callable[[], bool]] = None,
-) -> Dict[str, Any]:
-    """Run inference for ``patient_ts``, persist sidecars, and return the predictions.
+PRED_FLUSH_EVERY = 10
 
-    Writes ``predictions.json`` and ``prediction_metadata.json`` via the patient's
-    durable sidecar I/O. Never touches ``labels.json``. Returns the predictions dict
-    (also useful directly by the caller); returns ``{}`` if cancelled before any
-    timepoint completed.
+
+def _load_resumable_raw_scores(patient_ts, model_name: str, fingerprint: Any) -> Dict[int, List[float]]:
+    """Per-timepoint raw scores already persisted for *this* image set + model.
+
+    Returns ``{}`` when nothing reusable exists (no predictions yet, a different image
+    set, or a different model), forcing a fresh compute.
     """
-    triplets = _inference_triplet_paths(patient_ts)
-    class_names = [eb.DEPLOY_CLASS_MAPPING[i] for i in range(eb.NCLASS)]
-
-    raw_outputs = eb.run_timelapse_inference(
-        triplets,
-        model_name,
-        use_gpu=use_gpu,
-        progress_cb=progress_cb,
-        should_cancel=should_cancel,
-    )
-    # Don't persist a partial/empty run (e.g. the user cancelled mid-way).
-    if raw_outputs.shape[0] == 0 or (should_cancel is not None and should_cancel()):
+    meta = patient_ts.load_prediction_metadata()
+    if meta.get("image_fingerprint") != fingerprint or meta.get("model_name") != model_name:
         return {}
+    predictions = patient_ts.load_predictions()
+    timepoints = predictions.get("timepoints") if isinstance(predictions, dict) else None
+    if not isinstance(timepoints, dict):
+        return {}
+    resumable: Dict[int, List[float]] = {}
+    for key, entry in timepoints.items():
+        scores = entry.get("raw_scores") if isinstance(entry, dict) else None
+        if scores is not None:
+            resumable[int(key)] = [float(v) for v in scores]
+    return resumable
 
-    post_indices = eb.postprocess_monotonic(raw_outputs)
+
+def _persist_predictions(
+    patient_ts,
+    raw_by_tp: Dict[int, List[float]],
+    num_timepoints: int,
+    class_names: List[str],
+    labeler_names: List[str],
+    model_name: str,
+    fingerprint: Any,
+) -> Dict[str, Any]:
+    """Write predictions + metadata from the scores gathered so far (durable snapshot).
+
+    Postprocessing (monotonic decoding) is global, so it is recomputed over the
+    contiguous prefix of timepoints scored to date; intermediate snapshots refine as
+    more timepoints arrive and converge to the final sequence once complete.
+    """
+    indices = sorted(raw_by_tp)
+    raw_matrix = (
+        np.array([raw_by_tp[i] for i in indices], dtype=np.float64)
+        if indices
+        else np.empty((0, eb.NCLASS), dtype=np.float64)
+    )
+    post_indices = eb.postprocess_monotonic(raw_matrix) if raw_matrix.shape[0] else np.empty((0,), dtype=int)
 
     timepoints: Dict[str, Any] = {}
-    for timepoint in range(raw_outputs.shape[0]):
-        scores = raw_outputs[timepoint]
+    for position, timepoint in enumerate(indices):
+        scores = np.asarray(raw_by_tp[timepoint], dtype=np.float64)
         probs = _softmax(scores)
         raw_index = int(np.argmax(scores))
-        post_index = int(post_indices[timepoint])
+        post_index = int(post_indices[position])
         timepoints[str(timepoint)] = {
             "raw_scores": [float(v) for v in scores],
             "raw_class_index": raw_index,
-            "raw_class": map_deploy_to_labeler(class_names[raw_index]),
+            "raw_class": labeler_names[raw_index],
             "post_class_index": post_index,
-            "post_class": map_deploy_to_labeler(class_names[post_index]),
+            "post_class": labeler_names[post_index],
             "max_prob": float(probs.max()),
         }
 
     predictions = {
-        "class_names": [map_deploy_to_labeler(name) for name in class_names],
+        "class_names": labeler_names,
         "deploy_class_names": class_names,
         "timepoints": timepoints,
     }
@@ -139,13 +163,101 @@ def compute_and_save_predictions(
         "timestamp": _now_iso(),
         "depth_subset": list(eb.INFERENCE_DEPTHS),
         "postprocess": POSTPROCESS_METHOD,
-        "num_timepoints": int(raw_outputs.shape[0]),
-        "image_fingerprint": patient_ts.image_fingerprint(),
+        "num_timepoints": int(num_timepoints),
+        "computed_timepoints": len(indices),
+        "complete": len(indices) >= num_timepoints and num_timepoints > 0,
+        "image_fingerprint": fingerprint,
     }
-
     patient_ts.save_predictions(predictions)
     patient_ts.save_prediction_metadata(metadata)
     return predictions
+
+
+def compute_and_save_predictions(
+    patient_ts,
+    model_name: str,
+    use_gpu: Optional[bool] = None,
+    progress_cb: Optional[Callable[[int, int], None]] = None,
+    should_cancel: Optional[Callable[[], bool]] = None,
+    should_yield: Optional[Callable[[], bool]] = None,
+    resume: bool = True,
+) -> Dict[str, Any]:
+    """Run inference for ``patient_ts``, persisting predictions incrementally.
+
+    Writes ``predictions.json`` / ``prediction_metadata.json`` through the patient's
+    durable sidecar I/O, flushing partial progress as it goes. Never touches
+    ``labels.json``. When ``resume`` is True (default) it continues from any scores
+    already persisted for the same image set + model; pass ``resume=False`` to force a
+    full recompute (e.g. a deliberate "re-run"). ``should_yield`` lets a background run
+    step aside between timepoints for a higher-priority (on-screen) task. Returns the
+    predictions dict.
+    """
+    triplets = _inference_triplet_paths(patient_ts)
+    num_timepoints = len(triplets)
+    class_names = [eb.DEPLOY_CLASS_MAPPING[i] for i in range(eb.NCLASS)]
+    labeler_names = [map_deploy_to_labeler(name) for name in class_names]
+    fingerprint = patient_ts.image_fingerprint()
+
+    raw_by_tp: Dict[int, List[float]] = (
+        _load_resumable_raw_scores(patient_ts, model_name, fingerprint) if resume else {}
+    )
+    if progress_cb is not None:
+        progress_cb(len(raw_by_tp), num_timepoints)
+
+    # Everything already scored for this image set + model: just normalise the snapshot.
+    if num_timepoints > 0 and len(raw_by_tp) >= num_timepoints:
+        return _persist_predictions(
+            patient_ts, raw_by_tp, num_timepoints, class_names, labeler_names, model_name, fingerprint
+        )
+
+    # The RCNN box each timepoint needs is the same one the ROI display caches, so reuse
+    # it: read the shared cache, detect once on a miss, and write it back. This is the only
+    # RCNN pass — the classifier then runs on the box-cropped triplet (no second detection).
+    ref_depth = rcnn_roi.reference_depth(patient_ts)
+
+    def bbox_provider(index, images):
+        if ref_depth is not None and patient_ts.has_rcnn_box(ref_depth, index):
+            return patient_ts.get_rcnn_box(ref_depth, index)
+        bbox = eb.detect_triplet_bbox(images)
+        if ref_depth is not None:
+            patient_ts.set_rcnn_box(
+                ref_depth, index, list(bbox) if bbox is not None else None, save=False
+            )
+        return bbox
+
+    flushed_count = len(raw_by_tp)
+
+    def persist() -> Dict[str, Any]:
+        # Flush the shared ROI boxes alongside the scores so both survive an interruption.
+        patient_ts.save_rcnn_boxes()
+        return _persist_predictions(
+            patient_ts, raw_by_tp, num_timepoints, class_names, labeler_names, model_name, fingerprint
+        )
+
+    def result_cb(index: int, scores: np.ndarray) -> None:
+        nonlocal flushed_count
+        raw_by_tp[index] = [float(v) for v in np.asarray(scores, dtype=np.float64).ravel()]
+        if len(raw_by_tp) - flushed_count >= PRED_FLUSH_EVERY:
+            persist()
+            flushed_count = len(raw_by_tp)
+        if progress_cb is not None:
+            progress_cb(len(raw_by_tp), num_timepoints)
+
+    eb.run_timelapse_inference(
+        triplets,
+        model_name,
+        use_gpu=use_gpu,
+        done_indices=set(raw_by_tp),
+        bbox_provider=bbox_provider,
+        result_cb=result_cb,
+        should_cancel=should_cancel,
+        should_yield=should_yield,
+    )
+
+    # Final durable flush — persists whatever was scored, even if cancelled part-way, so
+    # the next run resumes from here rather than recomputing. Nothing scored (immediate
+    # cancel, no resume) leaves the sidecar untouched.
+    return persist() if raw_by_tp else patient_ts.load_predictions()
 
 
 # --------------------------------------------------------------------------------------
@@ -200,3 +312,18 @@ def predictions_stale(patient_ts) -> bool:
     if stored is None:
         return False
     return stored != patient_ts.image_fingerprint()
+
+
+def predictions_complete(patient_ts) -> bool:
+    """True only when every timepoint has been scored and persisted.
+
+    A partially-computed sidecar (an interrupted/resumable run) returns False so callers
+    re-launch the worker to resume. Legacy sidecars written before incremental support
+    (no ``complete`` flag) are treated as complete.
+    """
+    if not patient_ts.has_predictions():
+        return False
+    metadata = patient_ts.load_prediction_metadata()
+    if "complete" in metadata:
+        return bool(metadata["complete"])
+    return True

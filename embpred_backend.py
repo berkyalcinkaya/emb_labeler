@@ -21,9 +21,30 @@ from __future__ import annotations
 import os
 import sys
 import threading
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+import time
+from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 import numpy as np
+
+# How often a yielding (lower-priority) worker re-checks whether it may proceed.
+YIELD_POLL_SECONDS = 0.05
+
+
+def wait_while_yield(
+    should_yield: Optional[Callable[[], bool]],
+    should_cancel: Optional[Callable[[], bool]] = None,
+) -> None:
+    """Park (sleeping, releasing the CPU) while ``should_yield()`` is True.
+
+    Lets a background model task step aside between forward passes so the on-screen
+    embryo's task gets the shared model. Returns immediately when there's nothing to yield
+    to, or as soon as the caller is cancelled (so a paused task still stops promptly)."""
+    if should_yield is None:
+        return
+    while should_yield():
+        if should_cancel is not None and should_cancel():
+            return
+        time.sleep(YIELD_POLL_SECONDS)
 
 # --------------------------------------------------------------------------------------
 # Constants that do NOT require torch (safe to read at import time).
@@ -296,19 +317,76 @@ def clear_model_cache() -> None:
 # --------------------------------------------------------------------------------------
 # Inference.
 # --------------------------------------------------------------------------------------
+def detect_triplet_bbox(
+    images: Sequence[np.ndarray], use_gpu: Optional[bool] = None
+) -> Optional[Tuple[int, int, int, int]]:
+    """Embryo bbox for a ``(F-15, F0, F15)`` triplet, matching embpred's ExtractEmbFrame.
+
+    Tries the detector on F0 first, then F-15, then F15 (the same order and detector
+    ExtractEmbFrame uses), so a box produced here is identical to the one inference would
+    have computed internally. Returns ``(x1, y1, x2, y2)`` or None when no depth detects.
+    This is the single RCNN pass that the prediction and ROI-display paths share.
+    """
+    _ensure_embpred_importable()
+    from embpred_deploy.rcnn import get_emb_frame_bbox
+
+    rcnn_model, device = get_rcnn_model(use_gpu=use_gpu)
+    f_neg15, f0, f15 = (_to_uint8_gray(im) for im in images)
+    with _forward_lock:
+        for channel in (f0, f_neg15, f15):
+            bbox = get_emb_frame_bbox(channel, rcnn_model, device)
+            if bbox is not None:
+                x_min, y_min, x_max, y_max = (int(v) for v in bbox)
+                return x_min, y_min, x_max, y_max
+    return None
+
+
+def crop_triplet(
+    images: Sequence[np.ndarray], bbox: Optional[Sequence[int]], size: Tuple[int, int] = SIZE
+) -> List[np.ndarray]:
+    """Crop a ``(F-15, F0, F15)`` triplet to ``bbox``, exactly as embpred ExtractEmbFrame.
+
+    A known box crops + square-pads all three channels via embpred's ``crop_with_bbox``;
+    ``None`` (no detection) resizes the originals to ``size`` — the same fallback
+    ExtractEmbFrame applies. Splitting detection from cropping lets a precomputed/cached
+    box be reused without re-running the detector.
+    """
+    _ensure_embpred_importable()
+    import cv2
+    from embpred_deploy.rcnn import crop_with_bbox
+
+    f_neg15, f0, f15 = images
+    if bbox is None:
+        width, height = size
+        return [cv2.resize(im, (width, height)) for im in (f_neg15, f0, f15)]
+    return list(crop_with_bbox(f_neg15, f0, f15, tuple(int(v) for v in bbox)))
+
+
 def run_timelapse_inference(
     triplet_paths: Sequence[Tuple[str, str, str]],
     model_name: str,
     use_gpu: Optional[bool] = None,
+    done_indices: Optional[Set[int]] = None,
+    bbox_provider: Optional[Callable[[int, List[np.ndarray]], Optional[Tuple[int, int, int, int]]]] = None,
+    result_cb: Optional[Callable[[int, np.ndarray], None]] = None,
     progress_cb: Optional[Callable[[int, int], None]] = None,
     should_cancel: Optional[Callable[[], bool]] = None,
+    should_yield: Optional[Callable[[], bool]] = None,
 ) -> np.ndarray:
-    """Run the 3-depth ResNet over a timelapse and return raw scores ``(T, NCLASS)``.
+    """Run the 3-depth ResNet over a timelapse, scoring one timepoint at a time.
 
     ``triplet_paths[t]`` is ``(F-15_path, F0_path, F15_path)`` for timepoint ``t``.
-    Mirrors the embpred CLI's ``--timelapse-dir`` path (grayscale reads, RCNN bbox
-    extraction, ``inference(..., map_output=False)``) so the cached postprocessed
-    sequence matches ``embpred_deploy --postprocess`` for the same patient.
+    Mirrors the embpred CLI's ``--timelapse-dir`` path, but with bbox extraction and
+    classification *split*: the box comes from ``bbox_provider(index, images)`` (which can
+    return a cached box to avoid re-running the detector — see the prediction pipeline's
+    shared ROI cache) and the classifier then runs on the cropped triplet with
+    ``get_bbox=False``. With no provider it detects per frame via :func:`detect_triplet_bbox`,
+    yielding output identical to embpred's internal ``get_bbox=True`` path.
+
+    Designed for durable, resumable use: timepoints in ``done_indices`` are skipped, and
+    ``result_cb(index, scores)`` streams each freshly-scored timepoint's ``(NCLASS,)`` raw
+    scores so the caller can persist incrementally. Returns the stacked newly-computed
+    scores for callers that don't supply a callback.
     """
     _ensure_embpred_importable()
     import cv2
@@ -317,12 +395,19 @@ def run_timelapse_inference(
     # Touch the mapping check so a drifted embpred mapping fails fast.
     deploy_class_mapping()
 
+    done_indices = done_indices or set()
     classifier, device = get_classifier_model(model_name, use_gpu=use_gpu)
-    rcnn_model, _rcnn_device = get_rcnn_model(use_gpu=use_gpu)
 
     total = len(triplet_paths)
+    collecting = result_cb is None  # only retain everything in RAM when nobody streams it
     outputs: List[np.ndarray] = []
     for index, paths in enumerate(triplet_paths):
+        if should_cancel is not None and should_cancel():
+            break
+        if index in done_indices:
+            continue
+        # Step aside (between timepoints) while a higher-priority task wants the model.
+        wait_while_yield(should_yield, should_cancel)
         if should_cancel is not None and should_cancel():
             break
         images = []
@@ -331,30 +416,39 @@ def run_timelapse_inference(
             if img is None:
                 raise FileNotFoundError(f"Failed to read image for inference: {path}")
             images.append(img)
+        # One RCNN pass per frame, reused for ROI display via the shared cache.
+        if bbox_provider is not None:
+            bbox = bbox_provider(index, images)
+        else:
+            bbox = detect_triplet_bbox(images, use_gpu=use_gpu)
+        cropped = crop_triplet(images, bbox, size=SIZE)
         with _forward_lock:
             raw = inference(
                 classifier,
                 device,
-                images,
+                cropped,
                 map_output=False,
                 output_to_str=False,
-                rcnn_model=rcnn_model,
+                get_bbox=False,
                 size=SIZE,
             )
-        outputs.append(np.asarray(raw, dtype=np.float64))
+        scores = np.asarray(raw, dtype=np.float64).ravel()
+        if scores.shape[0] != NCLASS:
+            # The labeler's class mapping + monotonic decoding assume the 14-class head.
+            raise ValueError(
+                f"Model '{model_name}' produced {scores.shape[0]} classes but the labeler "
+                f"expects {NCLASS}. Choose a {NCLASS}-class model (e.g. a CustomResNet50)."
+            )
+        if collecting:
+            outputs.append(scores)
+        if result_cb is not None:
+            result_cb(index, scores)
         if progress_cb is not None:
             progress_cb(index + 1, total)
 
     if not outputs:
         return np.empty((0, NCLASS), dtype=np.float64)
-    result = np.vstack(outputs)
-    if result.shape[1] != NCLASS:
-        # The labeler's class mapping + monotonic decoding assume the 14-class head.
-        raise ValueError(
-            f"Model '{model_name}' produced {result.shape[1]} classes but the labeler "
-            f"expects {NCLASS}. Choose a {NCLASS}-class model (e.g. a CustomResNet50)."
-        )
-    return result
+    return np.vstack(outputs)
 
 
 def postprocess_monotonic(raw_outputs: np.ndarray) -> np.ndarray:
