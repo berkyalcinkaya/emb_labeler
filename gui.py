@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 from collections import Counter, defaultdict
 from datetime import datetime
@@ -13,8 +14,6 @@ import pyqtgraph as pg
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 from pyqtgraph.Qt import QtCore
-from pyqtgraph.dockarea.Dock import Dock
-from pyqtgraph.dockarea.DockArea import DockArea
 from PyQt5.QtCore import Qt, QThread, QTimer, pyqtSignal
 from PyQt5.QtGui import QColor, QKeySequence, QPalette
 from PyQt5.QtWidgets import (
@@ -1329,7 +1328,6 @@ class EmbryoLabelingApp(QMainWindow):
         if self.all_depths_window is None:
             self.all_depths_window = AllDepthsWindow(
                 self,
-                ORDERED_FOCAL_DEPTH,
                 self.current_patient_ts,
                 self.current_timepoint,
             )
@@ -2198,45 +2196,64 @@ class EmbryoLabelingApp(QMainWindow):
 
 
 class AllDepthsWindow(QMainWindow):
-    """Dockable window showing all focal depths for the current timepoint."""
+    """Window showing every present focal depth for the current timepoint in a
+    responsive grid that adapts to how many depths a patient actually has."""
 
-    def __init__(self, parent, depths: List[str], patient_ts, timepoint: int):
+    def __init__(self, parent, patient_ts, timepoint: int):
         super().__init__(parent)
-        self.depths = depths
         self.patient_ts = patient_ts
         self.timepoint = timepoint
+        # Keyed by actual depth index so absent depths are simply never built.
         self.depth_items: Dict[int, pg.ImageItem] = {}
+        self.depth_plots: Dict[int, pg.PlotItem] = {}
+        self._grid_depths: List[int] = []
 
         self.setWindowTitle("All Focal Depths")
-        self.setGeometry(100, 100, 1400, 900)
+        self.setGeometry(100, 100, 1200, 850)
         self.setStyleSheet(STYLESHEET)
 
         self.central_widget = QWidget()
         self.setCentralWidget(self.central_widget)
         self.layout = QVBoxLayout(self.central_widget)
 
-        self.reset_button = QPushButton("Reset")
-        self.reset_button.clicked.connect(self.reset_docks)
-        self.layout.addWidget(self.reset_button)
+        self.header_label = QLabel("")
+        self.header_label.setAlignment(Qt.AlignCenter)
+        self.header_label.setStyleSheet(
+            f"color: {C_TEXT}; font-size: 14px; font-weight: 600; padding: 6px;"
+        )
+        self.layout.addWidget(self.header_label)
 
-        self.dock_area: Optional[DockArea] = None
-        self._build_dock_area()
+        self.grid_container = QWidget()
+        self.grid_layout = QGridLayout(self.grid_container)
+        self.grid_layout.setSpacing(6)
+        self.layout.addWidget(self.grid_container, stretch=1)
+
         self.update_images(patient_ts, timepoint)
 
-    def _build_dock_area(self) -> None:
-        if self.dock_area is not None:
-            self.layout.removeWidget(self.dock_area)
-            self.dock_area.setParent(None)
-
-        self.dock_area = DockArea()
-        self.layout.addWidget(self.dock_area)
+    def _build_grid(self, depth_indices: List[int]) -> None:
+        """(Re)build one image pane per present focal depth in a near-square grid."""
+        while self.grid_layout.count():
+            item = self.grid_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.setParent(None)
         self.depth_items.clear()
+        self.depth_plots.clear()
+        self._grid_depths = list(depth_indices)
 
-        docks: List[Dock] = []
-        for i, depth in enumerate(self.depths):
-            dock = Dock(depth, size=(450, 320), closable=True)
+        count = len(depth_indices)
+        if count == 0:
+            return
+
+        # Near-square arrangement so panes stay large regardless of depth count.
+        columns = math.ceil(math.sqrt(count))
+        for position, depth_index in enumerate(depth_indices):
+            row, col = divmod(position, columns)
+            depth_name = self.patient_ts.get_depth_name(depth_index)
+
             glw = pg.GraphicsLayoutWidget()
-            plot = glw.addPlot(title=depth)
+            glw.setBackground(C_IMG_BG)
+            plot = glw.addPlot(title=depth_name)
             plot.setAspectLocked(True)
             plot.hideAxis("left")
             plot.hideAxis("bottom")
@@ -2244,36 +2261,45 @@ class AllDepthsWindow(QMainWindow):
 
             image_item = pg.ImageItem()
             plot.addItem(image_item)
-            dock.addWidget(glw)
-
-            docks.append(dock)
-            self.depth_items[i] = image_item
-
-        # Deterministic default: row 1 has 0,1,2; row 2 has 3,4,5; row 3 has 6.
-        self.dock_area.addDock(docks[0], "left")
-        self.dock_area.addDock(docks[1], "right", docks[0])
-        self.dock_area.addDock(docks[2], "right", docks[1])
-        self.dock_area.addDock(docks[3], "bottom", docks[0])
-        self.dock_area.addDock(docks[4], "right", docks[3])
-        self.dock_area.addDock(docks[5], "right", docks[4])
-        self.dock_area.addDock(docks[6], "bottom", docks[3])
+            self.grid_layout.addWidget(glw, row, col)
+            self.depth_items[depth_index] = image_item
+            self.depth_plots[depth_index] = plot
 
     def update_images(self, patient_ts, timepoint: int) -> None:
         self.patient_ts = patient_ts
         self.timepoint = timepoint
-        for depth_index, image_item in list(self.depth_items.items()):
-            if not patient_ts.depth_has_images(depth_index):
-                continue
+
+        populated = patient_ts.populated_depth_indices()
+        if populated != self._grid_depths:
+            self._build_grid(populated)
+
+        for depth_index, image_item in self.depth_items.items():
             try:
                 image = patient_ts.get_image(timepoint, depth_index)
                 image_item.setImage(image.T)
-            except RuntimeError:
-                # The user may have closed this dock; reset restores it.
+            except (RuntimeError, IndexError):
                 continue
 
-    def reset_docks(self) -> None:
-        self._build_dock_area()
-        self.update_images(self.patient_ts, self.timepoint)
+        self._refresh_chrome()
+
+    def _refresh_chrome(self) -> None:
+        """Update the header and highlight the depth currently being labeled."""
+        parent = self.parent()
+        current_depth = getattr(parent, "current_depth", None)
+
+        for depth_index, plot in self.depth_plots.items():
+            name = self.patient_ts.get_depth_name(depth_index)
+            if depth_index == current_depth:
+                plot.setTitle(f"▸ {name}", color=C_ACCENT, bold=True)
+            else:
+                plot.setTitle(name, color=C_MUTED)
+
+        patient_id = getattr(self.patient_ts, "patient_id", "")
+        count = len(self._grid_depths)
+        suffix = "depth" if count == 1 else "depths"
+        self.header_label.setText(
+            f"{patient_id}   ·   timepoint {self.timepoint + 1}   ·   {count} {suffix}"
+        )
 
     def closeEvent(self, event) -> None:
         parent = self.parent()
@@ -2937,7 +2963,6 @@ class SegmentationWindow(QMainWindow):
         # once ("all depths"), painting the same shared mask from any pane.
         self.all_depths = False
         self.panes: List[SegDepthPane] = []
-        self.dock_area: Optional[DockArea] = None
 
         self._dirty = False
         self._loading = False
@@ -2994,8 +3019,8 @@ class SegmentationWindow(QMainWindow):
         root.addWidget(self._build_toolbar())
 
         # Canvas container: holds either a single focal-depth pane or, in "all depths"
-        # mode, a DockArea tiling one pane per populated depth. Rebuilt by
-        # _build_canvas(); every pane shares the window's mask (see SegDepthPane).
+        # mode, a grid of one pane per populated depth. Rebuilt by _build_canvas();
+        # every pane shares the window's mask (see SegDepthPane).
         self.canvas_container = QWidget()
         self.canvas_layout = QVBoxLayout(self.canvas_container)
         self.canvas_layout.setContentsMargins(0, 0, 0, 0)
@@ -3168,8 +3193,8 @@ class SegmentationWindow(QMainWindow):
         """(Re)build the canvas for the current mode and patient.
 
         Single mode shows one pane for ``current_depth``; all-depths mode tiles one
-        pane per populated focal depth in a DockArea (mirroring ``AllDepthsWindow``).
-        Every pane paints the same shared per-timepoint mask.
+        pane per populated focal depth in a near-square grid (mirroring the dynamic
+        ``AllDepthsWindow`` grid). Every pane paints the same shared per-timepoint mask.
         """
         self._teardown_canvas()
         depths = (
@@ -3185,7 +3210,6 @@ class SegmentationWindow(QMainWindow):
     def _teardown_canvas(self) -> None:
         # Dropping the top-level widgets cascades to the views/items they own.
         self.panes = []
-        self.dock_area = None
         while self.canvas_layout.count():
             item = self.canvas_layout.takeAt(0)
             widget = item.widget()
@@ -3207,50 +3231,20 @@ class SegmentationWindow(QMainWindow):
 
     def _build_all_depths_canvas(self, depths: List[int]) -> None:
         container = QWidget()
-        vbox = QVBoxLayout(container)
-        vbox.setContentsMargins(0, 0, 0, 0)
-        vbox.setSpacing(4)
+        grid = QGridLayout(container)
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setSpacing(6)
 
-        reset_row = QHBoxLayout()
-        reset_btn = QPushButton("Reset layout")
-        reset_btn.setToolTip("Restore the default focal-depth tiling")
-        reset_btn.clicked.connect(self._reset_dock_layout)
-        reset_row.addWidget(reset_btn)
-        reset_row.addStretch(1)
-        vbox.addLayout(reset_row)
-
-        self.dock_area = DockArea()
-        vbox.addWidget(self.dock_area, 1)
-
-        docks: List[Dock] = []
-        for depth_index in depths:
+        # Near-square arrangement so panes stay large regardless of depth count
+        # (same heuristic as AllDepthsWindow).
+        columns = math.ceil(math.sqrt(len(depths)))
+        for position, depth_index in enumerate(depths):
+            row, col = divmod(position, columns)
             pane = SegDepthPane(self, depth_index)
-            # Non-closable: a painting surface shouldn't vanish mid-stroke; Reset re-tiles.
-            dock = Dock(self.patient_ts.get_depth_name(depth_index), size=(420, 300), closable=False)
-            dock.addWidget(pane.glw)
             self.panes.append(pane)
-            docks.append(dock)
-        self._tile_docks(docks)
+            grid.addWidget(pane.glw, row, col)
 
         self.canvas_layout.addWidget(container)
-
-    def _tile_docks(self, docks: List[Dock]) -> None:
-        """Tile docks ~3 per row (generalizes AllDepthsWindow's 3/3/1 layout)."""
-        row_start = previous = None
-        for i, dock in enumerate(docks):
-            if i == 0:
-                self.dock_area.addDock(dock, "left")
-                row_start = previous = dock
-            elif i % 3 == 0:
-                self.dock_area.addDock(dock, "bottom", row_start)
-                row_start = previous = dock
-            else:
-                self.dock_area.addDock(dock, "right", previous)
-                previous = dock
-
-    def _reset_dock_layout(self) -> None:
-        self._build_canvas()
-        self._refresh_canvas()
 
     def _refresh_canvas(self) -> None:
         """Repaint base images, overlay and selection across all panes, then fit each."""
