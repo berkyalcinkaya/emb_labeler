@@ -2929,7 +2929,11 @@ def draw_stage_timeline(
             [x[t] for t in valid], [primary[t] for t in valid],
             where="mid", color="#4ea3ff", linewidth=1.6, label="prediction",
         )
-    diff = [t for t in range(num_timepoints) if secondary[t] is not None and secondary[t] != primary[t]]
+    diff = (
+        [t for t in range(num_timepoints) if secondary[t] is not None and secondary[t] != primary[t]]
+        if app._show_decode_changed
+        else []
+    )
     if diff:
         axis.scatter(
             [x[t] for t in diff], [secondary[t] for t in diff],
