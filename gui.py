@@ -15,7 +15,7 @@ from matplotlib.figure import Figure
 from pyqtgraph.Qt import QtCore
 from pyqtgraph.dockarea.Dock import Dock
 from pyqtgraph.dockarea.DockArea import DockArea
-from PyQt5.QtCore import Qt, QThread, pyqtSignal
+from PyQt5.QtCore import Qt, QThread, QTimer, pyqtSignal
 from PyQt5.QtGui import QColor, QKeySequence, QPalette
 from PyQt5.QtWidgets import (
     QAction,
@@ -36,6 +36,7 @@ from PyQt5.QtWidgets import (
     QScrollArea,
     QShortcut,
     QSizePolicy,
+    QSpinBox,
     QToolButton,
     QVBoxLayout,
     QWidget,
@@ -46,7 +47,7 @@ import ocr as ocr_module
 import predictions as predmod
 import rcnn_roi
 import setup_models
-from data import DataSet, ORDERED_FOCAL_DEPTH
+from data import DataSet, ORDERED_FOCAL_DEPTH, SEGMENTATION_STAGES
 
 # Human-label classes. These are intentionally the same 14 names embpred_deploy
 # predicts (see embpred_backend.DEPLOY_CLASS_MAPPING), so predictions map onto labels
@@ -354,6 +355,7 @@ class EmbryoLabelingApp(QMainWindow):
         self.all_depths_window: Optional[AllDepthsWindow] = None
         self.dashboard_window: Optional[DashboardWindow] = None
         self.timeline_window: Optional["TimelineWindow"] = None
+        self.segmentation_window: Optional["SegmentationWindow"] = None
         self._updating_best_depth_checks = False
 
         # Assisted-labeling state (predictions / OCR / RCNN / anomalies).
@@ -461,6 +463,12 @@ class EmbryoLabelingApp(QMainWindow):
         self.show_all_depths_checkbox.stateChanged.connect(self.toggle_all_depths)
         for box in (self.show_roi_checkbox, self.auto_detect_roi_checkbox, self.show_all_depths_checkbox):
             row.addWidget(box)
+
+        self.segment_btn = QToolButton()
+        self.segment_btn.setText("✏ Segment")
+        self.segment_btn.setToolTip("Open the segmentation pane for tPN / tB masks (Ctrl+G)")
+        self.segment_btn.clicked.connect(self.open_segmentation_window)
+        row.addWidget(self.segment_btn)
 
         row.addWidget(self._vsep())
 
@@ -666,6 +674,11 @@ class EmbryoLabelingApp(QMainWindow):
         timeline_action.triggered.connect(self.open_timeline)
         tools_menu.addAction(timeline_action)
 
+        segmentation_action = QAction("Segmentation Pane", self)
+        segmentation_action.setShortcut("Ctrl+G")
+        segmentation_action.triggered.connect(self.open_segmentation_window)
+        tools_menu.addAction(segmentation_action)
+
         tools_menu.addSeparator()
         setup_action = QAction("Setup Models…", self)
         setup_action.triggered.connect(self.setup_models_dialog)
@@ -788,6 +801,9 @@ class EmbryoLabelingApp(QMainWindow):
 
         for widget in self._timeline_widgets():
             widget.set_patient(self.current_patient_ts)
+
+        if self.segmentation_window is not None:
+            self.segmentation_window.set_patient(self.current_patient_ts)
 
         # Auto-compute OCR / predictions / ROI boxes in the background (stale or
         # missing results are recomputed; already-current ones are skipped).
@@ -1126,6 +1142,22 @@ class EmbryoLabelingApp(QMainWindow):
         self.timeline_window.set_current_timepoint(self.current_timepoint)
         self.timeline_window.show()
         self.timeline_window.raise_()
+
+    def open_segmentation_window(self) -> None:
+        if self.current_patient_ts is None:
+            QMessageBox.warning(self, "No patient selected", "Load a dataset and select a patient first.")
+            return
+        if self.segmentation_window is None:
+            self.segmentation_window = SegmentationWindow(
+                self,
+                self.current_patient_ts,
+                timepoint=self.current_timepoint,
+                depth=self.current_depth,
+            )
+        else:
+            self.segmentation_window.set_patient(self.current_patient_ts)
+        self.segmentation_window.show()
+        self.segmentation_window.raise_()
 
     # ==================================================================
     # Background workers + progress
@@ -1630,6 +1662,9 @@ class EmbryoLabelingApp(QMainWindow):
         )
 
     def closeEvent(self, event) -> None:
+        # Persist any unsaved segmentation strokes before teardown.
+        if self.segmentation_window is not None:
+            self.segmentation_window._flush()
         # Ask background threads to stop and give them a moment to unwind so Qt doesn't
         # warn about a QThread being destroyed while still running.
         for worker in self._task_workers + ([self._roi_worker] if self._roi_worker else []):
@@ -2168,6 +2203,862 @@ class TimelineWindow(QMainWindow):
     def closeEvent(self, event) -> None:
         if isinstance(self.app, EmbryoLabelingApp):
             self.app.timeline_window = None
+        event.accept()
+
+
+# ----------------------------------------------------------------------------
+# Segmentation pane (pixel-level masks for tPN / tB).
+#
+# Drawing is adapted from yeastvision's pyqtgraph painting (parts/canvas.py): a brush
+# stamps integer class values straight into a numpy mask, which is rendered as a
+# translucent color overlay (lut[mask]) on top of the grayscale embryo. The mask is kept
+# in row-major (image) orientation so mask[r, c] aligns with get_image(...)[r, c] and the
+# saved arrays are directly usable for training. Masks are per-timepoint (the same mask
+# covers every focal depth) and per-stage, with exactly one class per pixel.
+# ----------------------------------------------------------------------------
+
+# Distinct, legible overlay colors per structure (index 0 = background = transparent).
+SEG_STRUCTURE_COLORS: Dict[str, List[str]] = {
+    "tPN": ["", "#ff5cc8"],                          # pronucleus — magenta
+    "tB":  ["", "#33c4ff", "#ffb000", "#b070ff"],    # TE — cyan, ICM — amber, ZP — violet
+}
+SEG_OVERLAY_ALPHA = 150          # 0..255 translucency of the painted overlay
+SEG_DEFAULT_BRUSH = 8            # brush radius in pixels
+SEG_MAX_BRUSH = 120
+SEG_BRUSH_STEP = 2
+SEG_UNDO_LIMIT = 40              # bounded pre-stroke mask snapshots (memory-safe)
+SEG_AUTOSAVE_MS = 600            # debounce window for autosave-on-stroke
+# Highlight for a selected connected mass (white frost — distinct from every structure
+# color). Ctrl+click (or Select mode) picks the contiguous region under the cursor and
+# Backspace/Delete removes it, mirroring yeastvision's click-select-then-delete flow.
+SEG_SELECT_RGBA = (255, 255, 255, 120)
+SEG_SELECT_CONNECTIVITY = np.ones((3, 3), dtype=int)   # 8-connected "mass"
+
+
+def _seg_lut(stage: str) -> np.ndarray:
+    """RGBA lookup table ``(K, 4)`` mapping each class index to its overlay color.
+
+    Index 0 (background) is fully transparent so the embryo image shows through.
+    """
+    names = SEGMENTATION_STAGES[stage]
+    colors = SEG_STRUCTURE_COLORS[stage]
+    lut = np.zeros((len(names), 4), dtype=np.ubyte)
+    for index in range(1, len(names)):
+        color = QColor(colors[index])
+        lut[index] = [color.red(), color.green(), color.blue(), SEG_OVERLAY_ALPHA]
+    return lut
+
+
+class SegViewBox(pg.ViewBox):
+    """ViewBox for the segmentation canvas.
+
+    Left-drag is reserved for the mask item (painting), so panning is on right-drag and
+    zooming on the wheel — the same button-repurposing idea as yeastvision's
+    ``ViewBoxNoRightDrag``, swapped so the primary button paints.
+    """
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.setMenuEnabled(False)
+        self.setMouseMode(pg.ViewBox.PanMode)
+
+    def mouseDragEvent(self, ev, axis=None):
+        if ev.button() in (QtCore.Qt.RightButton, QtCore.Qt.MiddleButton):
+            ev.accept()
+            # Pan using scene coordinates so the math is correct whether the event was
+            # delivered to the ViewBox directly or forwarded from the mask item (whose
+            # local frame is in image pixels, not scene pixels).
+            current = self.mapSceneToView(ev.scenePos())
+            previous = self.mapSceneToView(ev.lastScenePos())
+            self.translateBy(x=-(current.x() - previous.x()), y=-(current.y() - previous.y()))
+        else:
+            # Left/other drags belong to the mask item; don't pan or rubber-band.
+            ev.ignore()
+
+
+class SegImageDraw(pg.ImageItem):
+    """Translucent mask overlay that paints class values into the window's numpy mask.
+
+    Adapted from yeastvision's ``ImageDraw``: a precomputed disk brush kernel stamps the
+    active class index straight into ``window.mask`` (clipped to image bounds, like
+    ``drawAt``), and the overlay re-renders as ``lut[mask]``. Left-drag paints a continuous
+    stroke (kernel stamped along the dragged line); right/middle-drag is forwarded to the
+    ViewBox for panning. The eraser is just the brush with class index 0.
+    """
+
+    def __init__(self, window: "SegmentationWindow"):
+        super().__init__()
+        self.window = window
+        self.setOpts(axisOrder="row-major")
+        self.setZValue(10)
+        self._last_pos = None
+
+    def render_mask(self) -> None:
+        mask = self.window.mask
+        lut = self.window.lut
+        if mask is None:
+            self.clear()
+            return
+        safe = np.clip(mask, 0, len(lut) - 1)
+        self.setImage(lut[safe], autoLevels=False)
+
+    @staticmethod
+    def _is_select(ev) -> bool:
+        return bool(ev.modifiers() & QtCore.Qt.ControlModifier)
+
+    # --- mouse ------------------------------------------------------------
+    def mouseClickEvent(self, ev):
+        if self.window.mask is None or ev.button() != QtCore.Qt.LeftButton:
+            ev.ignore()
+            return
+        ev.accept()
+        if self.window.select_mode or self._is_select(ev):
+            self.window.select_mass_at(int(ev.pos().y()), int(ev.pos().x()))
+            return
+        self.window.begin_stroke()
+        self._stamp_at(int(ev.pos().y()), int(ev.pos().x()))
+        self.render_mask()
+        self.window.end_stroke()
+
+    def mouseDragEvent(self, ev):
+        if ev.button() != QtCore.Qt.LeftButton or self.window.mask is None:
+            # Right/middle drag pans; hand the event to the ViewBox.
+            self.window.view.mouseDragEvent(ev)
+            return
+        if self.window.select_mode or self._is_select(ev):
+            # Selecting, not painting: pick the mass under the drag start, ignore the rest.
+            ev.accept()
+            if ev.isStart():
+                self.window.select_mass_at(int(ev.pos().y()), int(ev.pos().x()))
+            return
+        ev.accept()
+        if ev.isStart():
+            self.window.begin_stroke()
+            self._stamp_at(int(ev.pos().y()), int(ev.pos().x()))
+            self._last_pos = ev.pos()
+        elif ev.isFinish():
+            self._last_pos = None
+            self.window.end_stroke()
+        else:
+            if self._last_pos is not None:
+                self._stamp_line(self._last_pos, ev.pos())
+            self._last_pos = ev.pos()
+        self.render_mask()
+
+    # --- brush stamping ---------------------------------------------------
+    def _stamp_line(self, p0, p1) -> None:
+        from skimage.draw import line
+
+        rr, cc = line(int(p0.y()), int(p0.x()), int(p1.y()), int(p1.x()))
+        for y, x in zip(rr, cc):
+            self._stamp_at(int(y), int(x))
+
+    def _stamp_at(self, cy: int, cx: int) -> None:
+        mask = self.window.mask
+        kernel = self.window.brush_kernel
+        height, width = mask.shape
+        kh, kw = kernel.shape
+        r0, c0 = cy - kh // 2, cx - kw // 2
+        # Intersect the kernel footprint with the image bounds (mirrors drawAt's clip).
+        mr0, mc0 = max(0, r0), max(0, c0)
+        mr1, mc1 = min(height, r0 + kh), min(width, c0 + kw)
+        if mr0 >= mr1 or mc0 >= mc1:
+            return
+        sub = kernel[mr0 - r0: mr1 - r0, mc0 - c0: mc1 - c0]
+        mask[mr0:mr1, mc0:mc1][sub] = self.window.current_class_index
+
+
+class SegmentationWindow(QMainWindow):
+    """Separate keyboard-first pane for painting pixel-level masks at tPN / tB frames.
+
+    Shares patient/image state with the main window like the other auxiliary windows
+    (``AllDepthsWindow`` / ``TimelineWindow``): the app holds a reference and repoints it
+    via :meth:`set_patient` on patient change. All filesystem access goes through
+    ``data.PatientTimeSeries``; this window only paints into an in-memory numpy mask and
+    calls the durable save/load APIs.
+    """
+
+    def __init__(self, app: "EmbryoLabelingApp", patient_ts, *, timepoint: int = 0, depth: Optional[int] = None):
+        super().__init__(app)
+        self.app = app
+        self.patient_ts = patient_ts
+        self.current_timepoint = timepoint
+        self.current_depth = (
+            depth if depth is not None
+            else (patient_ts.default_depth_index() if patient_ts else 0)
+        )
+        self.active_stage = next(iter(SEGMENTATION_STAGES))
+        self.current_class_index = 1
+        self.brush_size = SEG_DEFAULT_BRUSH
+        self.brush_kernel = self._make_kernel(self.brush_size)
+        self.lut = _seg_lut(self.active_stage)
+        self.mask: Optional[np.ndarray] = None
+
+        self._dirty = False
+        self._loading = False
+        self._undo: List[np.ndarray] = []
+        self._redo: List[np.ndarray] = []
+        self.structure_buttons = QButtonGroup(self)
+        self.class_by_button: Dict[QPushButton, int] = {}
+
+        # Mass-selection state (Ctrl+click / Select mode → Backspace deletes).
+        self.select_mode = False
+        self._selection: Optional[np.ndarray] = None   # boolean (H, W) union of selected masses
+
+        self.setWindowTitle("Segmentation")
+        self.setGeometry(140, 140, 1180, 900)
+        self.setStyleSheet(STYLESHEET)
+
+        self._autosave_timer = QTimer(self)
+        self._autosave_timer.setSingleShot(True)
+        self._autosave_timer.setInterval(SEG_AUTOSAVE_MS)
+        self._autosave_timer.timeout.connect(self._flush)
+
+        self._build_ui()
+        self._build_shortcuts()
+        self._apply_stage(self.active_stage)   # builds structure chips + lut
+
+        if patient_ts is not None and patient_ts.num_timepoints() > 0:
+            self._load_mask_for_current()
+            self._render_base()
+            self.view.autoRange()
+        self._update_indicators()
+
+    # ------------------------------------------------------------------
+    # UI construction
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _make_kernel(radius: int) -> np.ndarray:
+        from skimage.morphology import disk
+
+        return disk(max(0, int(radius))).astype(bool)
+
+    def _vsep(self) -> QFrame:
+        line = QFrame()
+        line.setFrameShape(QFrame.VLine)
+        line.setStyleSheet(f"color: {C_BORDER};")
+        return line
+
+    def _build_ui(self) -> None:
+        central = QWidget()
+        self.setCentralWidget(central)
+        root = QVBoxLayout(central)
+        root.setContentsMargins(8, 8, 8, 8)
+        root.setSpacing(8)
+
+        root.addWidget(self._build_toolbar())
+
+        self.glw = pg.GraphicsLayoutWidget()
+        self.glw.setBackground(C_IMG_BG)
+        self.view = SegViewBox()
+        self.view.setAspectLocked(True)
+        self.view.invertY(True)
+        self.glw.addItem(self.view)
+        self.base_item = pg.ImageItem()
+        self.base_item.setOpts(axisOrder="row-major")
+        self.mask_item = SegImageDraw(self)
+        self.selection_item = pg.ImageItem()
+        self.selection_item.setOpts(axisOrder="row-major")
+        self.selection_item.setZValue(20)   # selection highlight sits above the mask
+        self.view.addItem(self.base_item)
+        self.view.addItem(self.mask_item)
+        self.view.addItem(self.selection_item)
+        root.addWidget(self.glw, 1)
+
+        self.hint_label = QLabel(
+            "left-drag paint · right-drag pan · wheel zoom    |    "
+            "1/2/3 structure · 0/E erase · [ ] brush · Ctrl+Z/Ctrl+Shift+Z undo/redo · "
+            "Ctrl+click (or V) select mass · ⌫ delete · Esc clear · "
+            "← → frame · ↑ ↓ depth · P/B jump to tPN/tB · S switch stage"
+        )
+        self.hint_label.setStyleSheet(f"color: {C_MUTED}; font-size: 10px;")
+        root.addWidget(self.hint_label)
+
+    def _build_toolbar(self) -> QWidget:
+        bar = QFrame()
+        bar.setObjectName("Header")
+        row = QHBoxLayout(bar)
+        row.setContentsMargins(10, 6, 10, 6)
+        row.setSpacing(8)
+
+        # Active-stage selector.
+        self.stage_buttons = QButtonGroup(self)
+        for stage in SEGMENTATION_STAGES:
+            btn = QToolButton()
+            btn.setText(stage)
+            btn.setCheckable(True)
+            btn.setToolTip(f"Segment the {stage} stage")
+            btn.clicked.connect(lambda _c, s=stage: self.set_stage(s))
+            self.stage_buttons.addButton(btn)
+            row.addWidget(btn)
+        row.addWidget(self._vsep())
+
+        # Predictions-driven jumps.
+        self.jump_pn_btn = QToolButton()
+        self.jump_pn_btn.setText("⤓ tPN")
+        self.jump_pn_btn.setToolTip("Jump to the first predicted tPN frame (P)")
+        self.jump_pn_btn.clicked.connect(lambda: self.jump_to_stage("tPN"))
+        self.jump_b_btn = QToolButton()
+        self.jump_b_btn.setText("⤓ tB")
+        self.jump_b_btn.setToolTip("Jump to the first predicted tB frame (B)")
+        self.jump_b_btn.clicked.connect(lambda: self.jump_to_stage("tB"))
+        row.addWidget(self.jump_pn_btn)
+        row.addWidget(self.jump_b_btn)
+        row.addWidget(self._vsep())
+
+        # Frame + focal-depth navigation.
+        prev_tp = QToolButton()
+        prev_tp.setText("◂")
+        prev_tp.setToolTip("Previous timepoint (←)")
+        prev_tp.clicked.connect(self.prev_timepoint)
+        self.tp_indicator = QLabel("t —")
+        self.tp_indicator.setMinimumWidth(104)
+        self.tp_indicator.setAlignment(Qt.AlignCenter)
+        self.tp_indicator.setStyleSheet("font-weight: 600;")
+        next_tp = QToolButton()
+        next_tp.setText("▸")
+        next_tp.setToolTip("Next timepoint (→)")
+        next_tp.clicked.connect(self.next_timepoint)
+        row.addWidget(prev_tp)
+        row.addWidget(self.tp_indicator)
+        row.addWidget(next_tp)
+
+        prev_d = QToolButton()
+        prev_d.setText("▾")
+        prev_d.setToolTip("Lower focal depth (↓)")
+        prev_d.clicked.connect(self.prev_depth)
+        self.depth_indicator = QLabel("—")
+        self.depth_indicator.setMinimumWidth(48)
+        self.depth_indicator.setAlignment(Qt.AlignCenter)
+        next_d = QToolButton()
+        next_d.setText("▴")
+        next_d.setToolTip("Higher focal depth (↑)")
+        next_d.clicked.connect(self.next_depth)
+        row.addWidget(prev_d)
+        row.addWidget(self.depth_indicator)
+        row.addWidget(next_d)
+
+        row.addStretch(1)
+
+        # Structure chips (rebuilt per active stage).
+        self.structure_bar = QHBoxLayout()
+        self.structure_bar.setSpacing(5)
+        row.addLayout(self.structure_bar)
+        row.addWidget(self._vsep())
+
+        # Brush size.
+        row.addWidget(QLabel("brush"))
+        self.brush_spin = QSpinBox()
+        self.brush_spin.setRange(1, SEG_MAX_BRUSH)
+        self.brush_spin.setValue(self.brush_size)
+        self.brush_spin.setToolTip("Brush radius in pixels ([ / ])")
+        self.brush_spin.valueChanged.connect(self.set_brush_size)
+        row.addWidget(self.brush_spin)
+
+        # Select mass / undo / redo / clear.
+        self.select_btn = QToolButton()
+        self.select_btn.setText("⊙ select")
+        self.select_btn.setCheckable(True)
+        self.select_btn.setToolTip(
+            "Select connected masses to delete (or Ctrl+click); ⌫ deletes, Esc clears (V)"
+        )
+        self.select_btn.clicked.connect(lambda checked: self.toggle_select_mode(checked))
+        undo_btn = QToolButton()
+        undo_btn.setText("↶")
+        undo_btn.setToolTip("Undo (Ctrl+Z)")
+        undo_btn.clicked.connect(self.undo)
+        redo_btn = QToolButton()
+        redo_btn.setText("↷")
+        redo_btn.setToolTip("Redo (Ctrl+Shift+Z)")
+        redo_btn.clicked.connect(self.redo)
+        clear_btn = QToolButton()
+        clear_btn.setText("clear")
+        clear_btn.setToolTip("Clear this frame's mask")
+        clear_btn.clicked.connect(self.clear_mask)
+        row.addWidget(self.select_btn)
+        row.addWidget(undo_btn)
+        row.addWidget(redo_btn)
+        row.addWidget(clear_btn)
+
+        row.addWidget(self._vsep())
+        self.save_indicator = QLabel("")
+        self.save_indicator.setMinimumWidth(78)
+        self.save_indicator.setAlignment(Qt.AlignCenter)
+        row.addWidget(self.save_indicator)
+        return bar
+
+    def _build_shortcuts(self) -> None:
+        def add(key, fn):
+            shortcut = QShortcut(QKeySequence(key), self)
+            shortcut.activated.connect(fn)
+            return shortcut
+
+        self._shortcuts = [
+            add(Qt.Key_Left, self.prev_timepoint),
+            add(Qt.Key_Right, self.next_timepoint),
+            add(Qt.Key_Up, self.next_depth),
+            add(Qt.Key_Down, self.prev_depth),
+            add("[", lambda: self._bump_brush(-SEG_BRUSH_STEP)),
+            add("]", lambda: self._bump_brush(SEG_BRUSH_STEP)),
+            add("Ctrl+Z", self.undo),
+            add("Ctrl+Shift+Z", self.redo),
+            add("Ctrl+Y", self.redo),
+            add("Ctrl+S", self._flush),
+            add("S", self.toggle_stage),
+            add("V", self.toggle_select_mode),
+            add("P", lambda: self.jump_to_stage("tPN")),
+            add("B", lambda: self.jump_to_stage("tB")),
+            add("E", lambda: self.select_class(0)),
+        ]
+        for digit in range(4):
+            self._shortcuts.append(add(str(digit), lambda d=digit: self.select_class(d)))
+
+    # ------------------------------------------------------------------
+    # Stage / structure / brush selection
+    # ------------------------------------------------------------------
+    def _make_structure_chip(self, text: str, color: Optional[str], index: int) -> QPushButton:
+        chip = QPushButton(text)
+        chip.setCheckable(True)
+        chip.setCursor(Qt.PointingHandCursor)
+        base = (
+            f"QPushButton {{ text-align:left; padding:4px 10px; border-radius:6px;"
+            f" border:1px solid {C_BORDER}; background:{C_PANEL2};"
+        )
+        if color:
+            chip.setStyleSheet(
+                base + f" color:{C_TEXT}; }}"
+                f"QPushButton:checked {{ background:{color}; border-color:{color};"
+                " color:#10131a; font-weight:700; }"
+            )
+        else:
+            chip.setStyleSheet(
+                base + f" color:{C_MUTED}; }}"
+                f"QPushButton:checked {{ background:{C_HOVER}; color:{C_TEXT}; font-weight:600; }}"
+            )
+        chip.clicked.connect(lambda _c, i=index: self.select_class(i))
+        self.structure_buttons.addButton(chip)
+        self.class_by_button[chip] = index
+        return chip
+
+    def _rebuild_structure_chips(self) -> None:
+        for chip in list(self.class_by_button):
+            self.structure_buttons.removeButton(chip)
+            chip.setParent(None)
+            chip.deleteLater()
+        self.class_by_button.clear()
+        while self.structure_bar.count():
+            item = self.structure_bar.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.setParent(None)
+
+        names = SEGMENTATION_STAGES[self.active_stage]
+        colors = SEG_STRUCTURE_COLORS[self.active_stage]
+        for index in range(1, len(names)):
+            self.structure_bar.addWidget(
+                self._make_structure_chip(f"{index}  {names[index]}", colors[index], index)
+            )
+        self.structure_bar.addWidget(self._make_structure_chip("0  erase", None, 0))
+        self.select_class(1 if len(names) > 1 else 0)
+
+    def select_class(self, index: int) -> None:
+        names = SEGMENTATION_STAGES[self.active_stage]
+        if not (0 <= index < len(names)):
+            return
+        self.current_class_index = index
+        for chip, idx in self.class_by_button.items():
+            chip.setChecked(idx == index)
+
+    def set_brush_size(self, value: int) -> None:
+        self.brush_size = max(1, min(SEG_MAX_BRUSH, int(value)))
+        self.brush_kernel = self._make_kernel(self.brush_size)
+        if self.brush_spin.value() != self.brush_size:
+            self.brush_spin.blockSignals(True)
+            self.brush_spin.setValue(self.brush_size)
+            self.brush_spin.blockSignals(False)
+
+    def _bump_brush(self, delta: int) -> None:
+        self.set_brush_size(self.brush_size + delta)
+
+    def _apply_stage(self, stage: str) -> None:
+        self.active_stage = stage
+        self.lut = _seg_lut(stage)
+        for btn in self.stage_buttons.buttons():
+            btn.setChecked(btn.text() == stage)
+        self._rebuild_structure_chips()
+
+    def set_stage(self, stage: str) -> None:
+        if stage not in SEGMENTATION_STAGES:
+            return
+        if stage == self.active_stage and self.mask is not None:
+            for btn in self.stage_buttons.buttons():
+                btn.setChecked(btn.text() == stage)
+            return
+        self._flush()
+        self._apply_stage(stage)
+        self._load_mask_for_current()   # same frame, different stage → different mask file
+        self._update_indicators()
+
+    def toggle_stage(self) -> None:
+        stages = list(SEGMENTATION_STAGES)
+        nxt = stages[(stages.index(self.active_stage) + 1) % len(stages)]
+        self.set_stage(nxt)
+
+    # ------------------------------------------------------------------
+    # Image + mask display
+    # ------------------------------------------------------------------
+    def _render_base(self) -> None:
+        patient = self.patient_ts
+        if patient is None or not patient.depth_has_images(self.current_depth):
+            self.base_item.clear()
+            return
+        image = patient.get_image(self.current_timepoint, self.current_depth)
+        self.base_item.setImage(image, autoLevels=True)
+
+    def _load_mask_for_current(self) -> None:
+        self._loading = True
+        try:
+            patient = self.patient_ts
+            if (
+                patient is None
+                or patient.num_timepoints() == 0
+                or not patient.depth_has_images(self.current_depth)
+            ):
+                self.mask = None
+                self._selection = None
+                self.mask_item.clear()
+                self.selection_item.clear()
+                return
+            image = patient.get_image(self.current_timepoint, self.current_depth)
+            height, width = image.shape[:2]
+            mask, _meta = patient.load_segmentation_mask(self.active_stage, self.current_timepoint)
+            if mask is None:
+                mask = np.zeros((height, width), dtype=np.uint8)
+            elif mask.shape != (height, width):
+                QMessageBox.warning(
+                    self,
+                    "Mask size mismatch",
+                    f"The saved {self.active_stage} mask for t={self.current_timepoint} is "
+                    f"{mask.shape[1]}×{mask.shape[0]} but this image is {width}×{height}. "
+                    "Starting from a blank mask; the saved file is kept until you draw.",
+                )
+                mask = np.zeros((height, width), dtype=np.uint8)
+            self.mask = mask
+            self._undo.clear()
+            self._redo.clear()
+            self._selection = None
+            self._dirty = False
+            self.mask_item.render_mask()
+            self.selection_item.clear()
+        finally:
+            self._loading = False
+        self._update_save_indicator()
+
+    # ------------------------------------------------------------------
+    # Navigation
+    # ------------------------------------------------------------------
+    def prev_timepoint(self) -> None:
+        self._goto_timepoint(self.current_timepoint - 1)
+
+    def next_timepoint(self) -> None:
+        self._goto_timepoint(self.current_timepoint + 1)
+
+    def _goto_timepoint(self, timepoint: int) -> None:
+        patient = self.patient_ts
+        if patient is None or patient.num_timepoints() == 0:
+            return
+        timepoint = max(0, min(patient.num_timepoints() - 1, int(timepoint)))
+        if timepoint == self.current_timepoint:
+            return
+        self._flush()
+        self.current_timepoint = timepoint
+        self._load_mask_for_current()
+        self._render_base()
+        self._update_indicators()
+
+    def prev_depth(self) -> None:
+        self._goto_depth(-1)
+
+    def next_depth(self) -> None:
+        self._goto_depth(1)
+
+    def _goto_depth(self, step: int) -> None:
+        patient = self.patient_ts
+        if patient is None:
+            return
+        index = self.current_depth + step
+        while 0 <= index < patient.num_depths():
+            if patient.depth_has_images(index):
+                self.current_depth = index
+                # Mask is per-timepoint (depth-agnostic): only the background changes.
+                self._render_base()
+                self._update_indicators()
+                return
+            index += step
+
+    def jump_to_stage(self, stage: str) -> None:
+        patient = self.patient_ts
+        if patient is None:
+            return
+        pred = predmod.load_prediction_arrays(patient)
+        if not pred:
+            QMessageBox.information(
+                self,
+                "No predictions",
+                "No stage predictions for this patient yet. Run them from the main window "
+                "(Tools ▸ Run Predictions), or use the arrow keys to scroll to the frame.",
+            )
+            return
+        post = pred["post_class"]
+        target = next(
+            (t for t in range(pred["num_timepoints"]) if post[t] == stage), None
+        )
+        if target is None:
+            QMessageBox.information(
+                self,
+                f"No predicted {stage}",
+                f"No timepoint was predicted as {stage} for this patient. "
+                "Use the arrow keys to scroll to the frame manually if needed.",
+            )
+            return
+        self._flush()
+        self._apply_stage(stage)
+        self.current_timepoint = target
+        self._load_mask_for_current()
+        self._render_base()
+        self._update_indicators()
+        self.statusBar().showMessage(f"Jumped to predicted {stage} at t={target}", 4000)
+
+    # ------------------------------------------------------------------
+    # Stroke / undo / redo
+    # ------------------------------------------------------------------
+    def _push_undo(self) -> None:
+        """Snapshot the current mask onto the undo stack (drops the redo stack)."""
+        self._redo.clear()
+        if self.mask is not None:
+            self._undo.append(self.mask.copy())
+            if len(self._undo) > SEG_UNDO_LIMIT:
+                self._undo.pop(0)
+
+    def begin_stroke(self) -> None:
+        """Start a paint stroke: snapshot for undo and drop any mass selection."""
+        self._push_undo()
+        self.clear_selection()
+
+    def end_stroke(self) -> None:
+        self._mark_dirty()
+
+    def undo(self) -> None:
+        if not self._undo or self.mask is None:
+            return
+        self._redo.append(self.mask.copy())
+        self.mask = self._undo.pop()
+        self.clear_selection()
+        self.mask_item.render_mask()
+        self._mark_dirty()
+
+    def redo(self) -> None:
+        if not self._redo or self.mask is None:
+            return
+        self._undo.append(self.mask.copy())
+        self.mask = self._redo.pop()
+        self.clear_selection()
+        self.mask_item.render_mask()
+        self._mark_dirty()
+
+    def clear_mask(self) -> None:
+        if self.mask is None or not self.mask.any():
+            return
+        self.begin_stroke()
+        self.mask[:] = 0
+        self.mask_item.render_mask()
+        self._mark_dirty()
+
+    # ------------------------------------------------------------------
+    # Mass selection + delete (Ctrl+click / Select mode → Backspace)
+    # ------------------------------------------------------------------
+    def toggle_select_mode(self, on: Optional[bool] = None) -> None:
+        self.select_mode = (not self.select_mode) if on is None else bool(on)
+        if self.select_btn.isChecked() != self.select_mode:
+            self.select_btn.blockSignals(True)
+            self.select_btn.setChecked(self.select_mode)
+            self.select_btn.blockSignals(False)
+        if not self.select_mode:
+            self.clear_selection()
+        self.statusBar().showMessage(
+            "Select mode ON — click masses, ⌫ to delete, Esc to clear"
+            if self.select_mode else "Select mode off",
+            3000,
+        )
+
+    @staticmethod
+    def _connected_component(mask: np.ndarray, y: int, x: int) -> np.ndarray:
+        """Boolean (H, W) of the 8-connected region of same-class pixels containing (y, x)."""
+        from scipy import ndimage
+
+        labeled, _ = ndimage.label(mask == mask[y, x], structure=SEG_SELECT_CONNECTIVITY)
+        return labeled == labeled[y, x]
+
+    def select_mass_at(self, y: int, x: int) -> None:
+        mask = self.mask
+        if mask is None:
+            return
+        height, width = mask.shape
+        if not (0 <= y < height and 0 <= x < width):
+            return
+        if int(mask[y, x]) == 0:
+            self.clear_selection()   # clicking background clears the selection
+            return
+        component = self._connected_component(mask, y, x)
+        if self._selection is None:
+            self._selection = np.zeros((height, width), dtype=bool)
+        if self._selection[y, x]:        # toggle this mass off if already selected
+            self._selection &= ~component
+        else:
+            self._selection |= component
+        if not self._selection.any():
+            self._selection = None
+        self._render_selection()
+        self._update_indicators()
+        count = self._selection_count()
+        self.statusBar().showMessage(
+            f"{count} mass(es) selected — ⌫ to delete" if count else "Selection cleared", 3000
+        )
+
+    def _selection_count(self) -> int:
+        if self._selection is None or not self._selection.any():
+            return 0
+        from scipy import ndimage
+
+        _labeled, n = ndimage.label(self._selection, structure=SEG_SELECT_CONNECTIVITY)
+        return int(n)
+
+    def _render_selection(self) -> None:
+        if self._selection is None or not self._selection.any():
+            self.selection_item.clear()
+            return
+        highlight = np.zeros((*self._selection.shape, 4), dtype=np.uint8)
+        highlight[self._selection] = SEG_SELECT_RGBA
+        self.selection_item.setImage(highlight, autoLevels=False)
+
+    def clear_selection(self) -> None:
+        if self._selection is not None:
+            self._selection = None
+            self._render_selection()
+            self._update_indicators()
+
+    def delete_selection(self) -> None:
+        if self.mask is None or self._selection is None or not self._selection.any():
+            return
+        count = self._selection_count()
+        self._push_undo()                # undoable; keeps the selection until after delete
+        self.mask[self._selection] = 0
+        self._selection = None
+        self.mask_item.render_mask()
+        self._render_selection()
+        self._mark_dirty()
+        self._update_indicators()
+        self.statusBar().showMessage(f"Deleted {count} mass(es)", 3000)
+
+    def keyPressEvent(self, event) -> None:
+        # Backspace/Delete remove the selected masses; Esc clears the selection. Handled
+        # here (not as QShortcuts) so Backspace still edits the brush spin box when focused.
+        if event.key() in (Qt.Key_Backspace, Qt.Key_Delete):
+            if self._selection is not None and self._selection.any():
+                self.delete_selection()
+                event.accept()
+                return
+        elif event.key() == Qt.Key_Escape and self._selection is not None:
+            self.clear_selection()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    # ------------------------------------------------------------------
+    # Persistence (debounced autosave + synchronous flush)
+    # ------------------------------------------------------------------
+    def _mark_dirty(self) -> None:
+        if self._loading:
+            return
+        self._dirty = True
+        self._update_save_indicator()
+        self._autosave_timer.start()   # restart the debounce window
+
+    def _flush(self) -> None:
+        """Write the current frame's mask now (also called before any navigation)."""
+        if not self._dirty or self.patient_ts is None or self.mask is None:
+            return
+        self._autosave_timer.stop()
+        try:
+            self.patient_ts.save_segmentation_mask(
+                self.active_stage, self.current_timepoint, self.mask
+            )
+            self._dirty = False
+        except Exception as exc:
+            QMessageBox.critical(self, "Save failed", f"Could not save mask:\n{exc}")
+            return
+        self._update_save_indicator()
+        self._update_indicators()
+
+    # ------------------------------------------------------------------
+    # Indicators + patient swap
+    # ------------------------------------------------------------------
+    def _update_indicators(self) -> None:
+        patient = self.patient_ts
+        if patient is None or patient.num_timepoints() == 0:
+            self.tp_indicator.setText("t —")
+            self.depth_indicator.setText("—")
+            self._update_save_indicator()
+            return
+        drawn = self.mask is not None and bool(self.mask.any())
+        has_saved = patient.has_segmentation_mask(self.active_stage, self.current_timepoint)
+        flag = " ●" if (drawn or has_saved) else ""
+        self.tp_indicator.setText(
+            f"{self.active_stage} · t {self.current_timepoint}/{patient.num_timepoints() - 1}{flag}"
+        )
+        self.depth_indicator.setText(patient.get_depth_name(self.current_depth))
+        self._update_save_indicator()
+
+    def _update_save_indicator(self) -> None:
+        if self.mask is None:
+            self.save_indicator.setText("")
+            return
+        if self._dirty:
+            self.save_indicator.setText("● unsaved")
+            self.save_indicator.setStyleSheet(f"color: {C_PRED};")
+        elif self.patient_ts is not None and self.patient_ts.has_segmentation_mask(
+            self.active_stage, self.current_timepoint
+        ):
+            self.save_indicator.setText("✓ saved")
+            self.save_indicator.setStyleSheet(f"color: {C_ACCENT};")
+        else:
+            self.save_indicator.setText("empty")
+            self.save_indicator.setStyleSheet(f"color: {C_MUTED};")
+
+    def set_patient(self, patient_ts) -> None:
+        self._flush()
+        self.patient_ts = patient_ts
+        self.current_timepoint = 0
+        self.current_depth = patient_ts.default_depth_index() if patient_ts else 0
+        self._undo.clear()
+        self._redo.clear()
+        self._selection = None
+        self._dirty = False
+        if patient_ts is not None and patient_ts.num_timepoints() > 0:
+            self._load_mask_for_current()
+            self._render_base()
+            self.view.autoRange()
+        else:
+            self.mask = None
+            self.base_item.clear()
+            self.mask_item.clear()
+            self.selection_item.clear()
+        self._update_indicators()
+
+    def closeEvent(self, event) -> None:
+        self._flush()
+        if isinstance(self.app, EmbryoLabelingApp):
+            self.app.segmentation_window = None
         event.accept()
 
 

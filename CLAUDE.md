@@ -13,8 +13,8 @@ Desktop GUI for labeling time-lapse embryo images across patients, timepoints, a
 - Deps: `requirements.txt`
 
 ## Architecture
-- `data.py` — `DataSet`, `PatientTimeSeries`, label I/O, lazy image loading
-- `gui.py` — `EmbryoLabelingApp`, `AllDepthsWindow`, `DashboardWindow`
+- `data.py` — `DataSet`, `PatientTimeSeries`, label I/O, segmentation-mask I/O, lazy image loading
+- `gui.py` — `EmbryoLabelingApp`, `AllDepthsWindow`, `DashboardWindow`, `SegmentationWindow`
 - `Notebook_OCR.ipynb` — reference for RapidOCR time extraction (planned feature)
 
 Do not put persistence or image-path logic in `gui.py`. Do not put Qt widgets in `data.py`.
@@ -23,6 +23,10 @@ Do not put persistence or image-path logic in `gui.py`. Do not put Qt widgets in
 - **Focal depths** (fixed order): F-45 … F45 (`ORDERED_FOCAL_DEPTH` in `data.py`)
 - **Timepoint labels**: tEmpty, t2–t8, tPN, tPNf, tM, tBlastocyst (`CLASSES` in `gui.py`)
 - **Best depths**: subset of focal depths per timepoint
+- **Segmentation masks**: pixel-level, manual-only, at tPN (pronucleus) and tB (TE/ICM/ZP);
+  per-timepoint (depth-agnostic), one class per pixel. Stored as a new computed artifact in
+  `segmentation/<stage>_t<NNNN>.npz`, separate from human labels (`SegmentationWindow` in
+  `gui.py`; mask I/O in `data.py`). See `claude-plans/segmentation-pane.md`.
 - Outputs per patient: `labels.json`, `label_metadata.json` (see README for schema)
 
 ## UX conventions

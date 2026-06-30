@@ -23,6 +23,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import zipfile
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -60,6 +61,21 @@ OCR_TIMES_FILENAME = "ocr_times.json"
 PREDICTIONS_FILENAME = "predictions.json"
 RCNN_BOXES_FILENAME = "rcnn_boxes.json"
 PREDICTION_METADATA_FILENAME = "prediction_metadata.json"
+
+# Pixel-level segmentation masks are a new per-patient computed artifact, kept separate
+# from the human timepoint labels. Masks are per-timepoint (depth-agnostic: one mask
+# covers every focal depth at a timepoint) and per-stage; exactly one class per pixel.
+# Each saved mask is a compressed numpy file under the patient's segmentation subdir.
+SEGMENTATION_DIRNAME = "segmentation"
+SEG_FORMAT_VERSION = 1
+
+# Class label sets per segmentable stage. Index = the integer value stored in the mask;
+# index 0 is always background. This is the single source of truth for class indices,
+# shared by persistence (here) and the drawing pane (gui.py supplies the colors/hotkeys).
+SEGMENTATION_STAGES: Dict[str, List[str]] = {
+    "tPN": ["background", "pronucleus"],
+    "tB": ["background", "TE", "ICM", "ZP"],
+}
 
 
 class DataSet:
@@ -466,6 +482,117 @@ class PatientTimeSeries:
         self._rcnn_boxes = {}
         if os.path.exists(self.rcnn_boxes_path()):
             os.remove(self.rcnn_boxes_path())
+
+    # -------------------------
+    # Segmentation masks (pixel-level, per-timepoint, per-stage)
+    #
+    # Stored as one compressed .npz per saved mask under <patient>/segmentation/,
+    # named "<stage>_t<NNNN>.npz". Each file holds the integer label array plus an
+    # embedded JSON `meta` blob so a mask is self-describing for downstream training.
+    # Writes are atomic (temp file + os.replace) so a crash mid-save cannot corrupt a
+    # previously saved mask. Masks never touch labels.json.
+    # -------------------------
+    @staticmethod
+    def _write_npz_atomic(path: str, **arrays: Any) -> None:
+        """Write a compressed .npz via a temp file + os.replace (durable writes).
+
+        A file object is passed to ``np.savez_compressed`` so it does not append its own
+        ``.npz`` suffix to the temp path.
+        """
+        tmp_path = f"{path}.tmp"
+        with open(tmp_path, "wb") as file:
+            np.savez_compressed(file, **arrays)
+        os.replace(tmp_path, path)
+
+    def segmentation_dir(self, create: bool = False) -> str:
+        path = os.path.join(self.directory, SEGMENTATION_DIRNAME)
+        if create:
+            os.makedirs(path, exist_ok=True)
+        return path
+
+    def segmentation_mask_path(self, stage: str, timepoint: int) -> str:
+        return os.path.join(self.segmentation_dir(), f"{stage}_t{int(timepoint):04d}.npz")
+
+    def has_segmentation_mask(self, stage: str, timepoint: int) -> bool:
+        return os.path.exists(self.segmentation_mask_path(stage, timepoint))
+
+    def segmented_timepoints(self, stage: str) -> List[int]:
+        """Timepoints that have a saved mask for ``stage`` (cheap: a single listdir)."""
+        seg_dir = self.segmentation_dir()
+        if not os.path.isdir(seg_dir):
+            return []
+        prefix, suffix = f"{stage}_t", ".npz"
+        result: List[int] = []
+        for name in os.listdir(seg_dir):
+            if name.startswith(prefix) and name.endswith(suffix):
+                stem = name[len(prefix):-len(suffix)]
+                if stem.isdigit():
+                    result.append(int(stem))
+        return sorted(result)
+
+    def load_segmentation_mask(
+        self, stage: str, timepoint: int
+    ) -> Tuple[Optional[np.ndarray], Dict[str, Any]]:
+        """Return ``(mask, meta)`` for a saved mask, or ``(None, {})`` if absent/corrupt.
+
+        ``mask`` is a ``uint8`` ``(H, W)`` array in row-major (image) orientation so
+        ``mask[r, c]`` aligns with ``get_image(...)[r, c]``. Tolerant of a truncated or
+        unreadable file (mirrors ``_read_json``): returns ``(None, {})`` rather than raising.
+        """
+        path = self.segmentation_mask_path(stage, timepoint)
+        if not os.path.exists(path):
+            return None, {}
+        try:
+            with np.load(path, allow_pickle=False) as npz:
+                mask = np.asarray(npz["mask"], dtype=np.uint8)
+                meta: Dict[str, Any] = {}
+                if "meta" in npz:
+                    try:
+                        meta = json.loads(str(npz["meta"].item()))
+                    except (ValueError, TypeError):
+                        meta = {}
+            return mask, meta
+        except (OSError, ValueError, KeyError, EOFError, zipfile.BadZipFile):
+            return None, {}
+
+    def save_segmentation_mask(self, stage: str, timepoint: int, mask: np.ndarray) -> None:
+        """Durably persist ``mask`` for ``(stage, timepoint)``.
+
+        An all-background mask carries no annotation, so its file is removed instead of
+        written (keeps ``has_segmentation_mask`` / ``segmented_timepoints`` accurate).
+        """
+        if stage not in SEGMENTATION_STAGES:
+            raise ValueError(f"Unknown segmentation stage: {stage!r}")
+        mask = np.ascontiguousarray(mask, dtype=np.uint8)
+        if mask.ndim != 2:
+            raise ValueError("Segmentation mask must be 2-D (H, W).")
+
+        if not mask.any():
+            self.delete_segmentation_mask(stage, timepoint)
+            return
+
+        class_names = SEGMENTATION_STAGES[stage]
+        meta = {
+            "format_version": SEG_FORMAT_VERSION,
+            "stage": stage,
+            "timepoint": int(timepoint),
+            "height": int(mask.shape[0]),
+            "width": int(mask.shape[1]),
+            "class_indices": {str(i): name for i, name in enumerate(class_names)},
+            "image_fingerprint": self.image_fingerprint(),
+            "timestamp": self._now_iso(),
+        }
+        self.segmentation_dir(create=True)
+        self._write_npz_atomic(
+            self.segmentation_mask_path(stage, timepoint),
+            mask=mask,
+            meta=np.array(json.dumps(meta)),
+        )
+
+    def delete_segmentation_mask(self, stage: str, timepoint: int) -> None:
+        path = self.segmentation_mask_path(stage, timepoint)
+        if os.path.exists(path):
+            os.remove(path)
 
     # --- Image-set fingerprint (detect when computed artifacts are stale) ---
     def image_fingerprint(self) -> Dict[str, List[int]]:

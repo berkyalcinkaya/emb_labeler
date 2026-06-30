@@ -158,6 +158,48 @@ frame (off the UI thread); boxes are cached so revisiting is instant.
 (Arrow keys still drive timepoint/depth navigation.) The **Assist** menu also exposes
 "Accept predictions for stage" and "Toggle raw / postprocessed".
 
+## Segmentation pane (pixel-level masks)
+
+Beyond per-timepoint classification, the labeler can draw **pixel-level masks** at two
+embryo stages. Open it with the header **✏ Segment** button or **Tools ▸ Segmentation
+Pane** (`Ctrl+G`). It is a separate window that shares the current patient with the main
+view; this is a **manual drawing tool only** (no segmentation model/inference).
+
+- **tPN** — segment the **pronucleus**.
+- **tB** — segment the **trophectoderm (TE)**, **inner cell mass (ICM)**, and **zona
+  pellucida (ZP)**.
+
+Masks are **per-timepoint** (the same mask covers every focal depth at a timepoint) and
+**per-stage**, with exactly one class per pixel. Drawing is modeled on `yeastvision`'s
+pyqtgraph painting: a brush stamps the active class straight into the mask, shown as a
+translucent color overlay over the embryo (TE cyan, ICM amber, ZP violet, pronucleus
+magenta).
+
+Get to the right frames fast with **⤓ tPN** / **⤓ tB** (or `P` / `B`), which jump to the
+first frame the model predicted as that stage; if there are no predictions, or none of
+that stage, the pane says so. Depth defaults to F0 and **↑ ↓** scrolls focal depths (the
+mask is unchanged — only the background image moves). Masks autosave shortly after each
+stroke and are flushed before you navigate away or close.
+
+To remove a stray blob, **Ctrl+click** it (or toggle **⊙ select** / `V`, then click) to
+highlight the connected mass — click more to add, click again to deselect — and press
+**Backspace/Delete** to erase the selected masses (undoable); **Esc** clears the selection.
+
+### Segmentation shortcuts
+
+| Key | Action |
+| --- | --- |
+| left-drag / right-drag / wheel | paint / pan / zoom |
+| `1` `2` `3` | select structure (per active stage) |
+| `0` / `E` | eraser (paint background) |
+| `[` / `]` | smaller / larger brush |
+| `Ctrl+Z` / `Ctrl+Shift+Z` | undo / redo |
+| `Ctrl+click` / `V` | select connected mass under cursor / toggle select mode |
+| `Backspace` `Delete` / `Esc` | delete selected masses / clear selection |
+| `← →` / `↑ ↓` | timepoint / focal depth |
+| `P` / `B` | jump to first predicted tPN / tB |
+| `S` | switch active stage |
+
 ## Files written into each patient folder (computed artifacts)
 
 These sidecars are written next to the images and are kept **separate** from the
@@ -169,6 +211,7 @@ human-authored `labels.json` / `label_metadata.json` (which are never overwritte
 | `predictions.json` | Per-timepoint raw scores, raw argmax, and postprocessed class |
 | `rcnn_boxes.json` | RCNN embryo box per `(depth, timepoint)`; `null` = center-crop fallback |
 | `prediction_metadata.json` | Model name, RCNN weights, embpred version, timestamp, depth subset, image fingerprint |
+| `segmentation/<stage>_t<NNNN>.npz` | One compressed mask per `(stage, timepoint)`: a `uint8` `(H, W)` label array (`mask[r,c]` aligns with the image) plus an embedded JSON `meta` (stage, dims, class index→name, image fingerprint, timestamp). All-background masks are not written. Directly loadable for training via `np.load(p)["mask"]`. |
 
 ## Notes
 
