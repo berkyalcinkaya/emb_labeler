@@ -22,7 +22,7 @@ is still expressed explicitly below so any future divergence is one obvious edit
 Depth mapping
 -------------
 Inference uses the 3-depth subset ``F-15, F0, F15`` (``embpred_backend.INFERENCE_DEPTHS``)
-while the labeler keeps all 7 depths for labeling / best-depth UI.
+while the labeler keeps all 7 depths for labeling / focal-depth navigation.
 """
 
 from __future__ import annotations

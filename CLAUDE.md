@@ -22,7 +22,6 @@ Do not put persistence or image-path logic in `gui.py`. Do not put Qt widgets in
 ## Domain
 - **Focal depths** (fixed order): F-45 … F45 (`ORDERED_FOCAL_DEPTH` in `data.py`)
 - **Timepoint labels**: tEmpty, t2–t8, tPN, tPNf, tM, tBlastocyst (`CLASSES` in `gui.py`)
-- **Best depths**: subset of focal depths per timepoint
 - Outputs per patient: `labels.json`, `label_metadata.json` (see README for schema)
 
 ## UX conventions
