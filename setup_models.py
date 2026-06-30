@@ -64,6 +64,32 @@ def _classify_aws_error(stderr: str) -> Optional[Exception]:
     return None
 
 
+def auth_status() -> "tuple[bool, str]":
+    """Return ``(authenticated, human-readable status/guidance)``.
+
+    Single source of truth for the GUI's AWS state: drives the model status chip and
+    whether S3-backed actions (e.g. Re-run Predictions) are enabled. Never raises —
+    turns the "no CLI" / "no creds" cases into a friendly message instead.
+    """
+    if not aws_cli_available():
+        return False, (
+            "AWS CLI not found on PATH. Install it and run `aws configure` to download "
+            "models from the cfai-model-weights bucket."
+        )
+    arn = aws_identity()
+    if arn:
+        return True, f"Signed in to AWS as {arn}"
+    return False, (
+        "Not signed in to AWS. Run `aws configure` (or `aws sso login`) with access to "
+        "the cfai-model-weights bucket to list/download models."
+    )
+
+
+def is_authenticated() -> bool:
+    """True if the AWS CLI exists and reports a caller identity."""
+    return auth_status()[0]
+
+
 def aws_identity() -> Optional[str]:
     """Return the caller's ARN if authenticated, else None (CLI must exist)."""
     _require_aws()

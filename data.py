@@ -256,18 +256,20 @@ class PatientTimeSeries:
     def load_labels(self) -> Dict[str, Dict[str, Any]]:
         path = self.labels_path()
         if not os.path.exists(path):
-            return {"timepoint_labels": {}, "best_depths": {}}
+            return {"timepoint_labels": {}}
 
         with open(path, "r", encoding="utf-8") as file:
             loaded = json.load(file)
 
-        # Migration path for older labels.json files that were flat timepoint->label dicts.
-        if "timepoint_labels" not in loaded and "best_depths" not in loaded:
-            return {"timepoint_labels": loaded, "best_depths": {}}
-
-        loaded.setdefault("timepoint_labels", {})
-        loaded.setdefault("best_depths", {})
-        return loaded
+        # Normalize to just timepoint_labels. Older files may be a flat timepoint->label
+        # dict, or a structured dict that still carries a now-removed "best_depths"
+        # section; the latter is dropped (and won't be written back).
+        if "timepoint_labels" in loaded:
+            return {"timepoint_labels": loaded.get("timepoint_labels", {})}
+        if "best_depths" in loaded:
+            return {"timepoint_labels": {}}
+        # Oldest format: a flat timepoint -> label dict.
+        return {"timepoint_labels": loaded}
 
     def save_labels(self) -> None:
         with open(self.labels_path(), "w", encoding="utf-8") as file:
@@ -333,45 +335,6 @@ class PatientTimeSeries:
 
     def get_label(self, timepoint: int) -> Optional[str]:
         return self.labels["timepoint_labels"].get(str(timepoint))
-
-    def set_best_depths(self, timepoint: int, depths: List[str]) -> None:
-        if len(depths) > 3:
-            raise ValueError("At most three focal depths can be selected.")
-        invalid = [depth for depth in depths if depth not in self.depths]
-        if invalid:
-            raise ValueError(f"Invalid focal depth names: {invalid}")
-
-        key = str(timepoint)
-        previous = self.labels["best_depths"].get(key)
-        if previous == depths:
-            return
-
-        previous_complete = isinstance(previous, list) and len(previous) == 3
-        complete = len(depths) == 3
-        if previous is None:
-            action = "created" if complete else "partial_created"
-        elif previous_complete and not complete:
-            action = "partial_updated"
-        elif not previous_complete and complete:
-            action = "created"
-        else:
-            action = "updated"
-
-        self.labels["best_depths"][key] = depths
-        self._append_metadata_event(
-            event_type="best_depths",
-            timepoint=timepoint,
-            value=depths,
-            previous_value=previous,
-            action=action,
-            complete=complete,
-        )
-        self.save_labels()
-        self.save_label_metadata()
-
-    def get_best_depths(self, timepoint: int) -> List[str]:
-        value = self.labels["best_depths"].get(str(timepoint), [])
-        return value if isinstance(value, list) else []
 
     # -------------------------
     # Computed-artifact sidecar persistence

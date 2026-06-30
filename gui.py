@@ -31,6 +31,7 @@ from PyQt5.QtWidgets import (
     QLabel,
     QMainWindow,
     QMessageBox,
+    QProgressBar,
     QProgressDialog,
     QPushButton,
     QScrollArea,
@@ -123,6 +124,16 @@ QComboBox QAbstractItemView {{
     background: {C_PANEL2}; color: {C_TEXT}; selection-background-color: {C_ACCENT};
 }}
 QScrollArea {{ border: none; }}
+/* Background-task progress bars (rail). The chunk color tracks task state. */
+QProgressBar {{
+    background: {C_PANEL2}; border: 1px solid {C_BORDER}; border-radius: 3px;
+    min-height: 6px; max-height: 6px;
+}}
+QProgressBar::chunk {{ background: {C_MUTED}; border-radius: 3px; }}
+QProgressBar[state="running"]::chunk,
+QProgressBar[state="done"]::chunk {{ background: {C_ACCENT}; }}
+QProgressBar[state="error"] {{ border-color: {C_ANOM}; }}
+QProgressBar[state="error"]::chunk {{ background: {C_ANOM}; }}
 QScrollBar:vertical {{ background: {C_BG}; width: 10px; margin: 0; }}
 QScrollBar::handle:vertical {{ background: {C_BORDER}; border-radius: 5px; min-height: 24px; }}
 QScrollBar::add-line, QScrollBar::sub-line {{ height: 0; }}
@@ -143,16 +154,6 @@ QPushButton[chip="label"]:checked {{
     background: {C_ACCENT}; border-color: {C_ACCENT}; color: #0c1f0c; font-weight: 600;
 }}
 QPushButton[chip="label"][predicted="true"] {{ border: 2px solid {C_PRED}; }}
-/* Depth chips */
-QPushButton[chip="depth"] {{
-    padding: 4px 0; border-radius: 6px; border: 1px solid {C_BORDER};
-    background: {C_PANEL2}; color: {C_MUTED}; font-size: 11px;
-}}
-QPushButton[chip="depth"]:hover {{ background: {C_HOVER}; }}
-QPushButton[chip="depth"]:checked {{
-    background: {C_ACCENT}; border-color: {C_ACCENT}; color: #0c1f0c; font-weight: 700;
-}}
-QPushButton[chip="depth"][current="true"] {{ border: 2px solid {C_TEXT}; color: {C_TEXT}; }}
 """
 
 
@@ -176,48 +177,69 @@ def apply_dark_palette(app: QApplication) -> None:
     app.setPalette(palette)
 
 
-class TaskDot(QWidget):
-    """Compact background-task indicator for the header: a colored dot + label.
+class TaskProgressBar(QWidget):
+    """A labeled progress bar for one background task (OCR / predictions / ROI boxes).
 
-    Exposes the same surface the app uses to drive a task row — ``start`` wires a
-    :class:`FunctionWorker`'s signals, and ``worker`` reflects the live worker so the
-    app can tell whether a task is running. Clicking an active dot cancels it.
+    Lives in the right rail. Exposes the surface the app uses to drive a task —
+    ``start`` wires a :class:`FunctionWorker`'s signals, and ``worker`` reflects the
+    live worker so the app can tell whether a task is running. Idle / running / done /
+    error are conveyed by the bar's fill color and the status text; an errored task
+    (e.g. missing model weights) turns the bar red. Clicking a running bar cancels it.
     """
-
-    _ACTIVE = C_ACCENT
-    _IDLE = C_MUTED
-    _ERROR = C_ANOM
 
     def __init__(self, name: str, parent=None):
         super().__init__(parent)
-        layout = QHBoxLayout(self)
+        layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(4)
+        layout.setSpacing(2)
         self._name = name
-        self.dot = QLabel("●")
-        self.dot.setStyleSheet(f"color: {self._IDLE}; font-size: 13px;")
+
+        head = QHBoxLayout()
+        head.setContentsMargins(0, 0, 0, 0)
+        head.setSpacing(4)
         self.name_label = QLabel(name)
-        self.name_label.setStyleSheet(f"color: {C_MUTED}; font-size: 11px;")
-        layout.addWidget(self.dot)
-        layout.addWidget(self.name_label)
+        self.name_label.setStyleSheet(f"color: {C_TEXT}; font-size: 10px; font-weight: 600;")
+        self.status_label = QLabel("idle")
+        self.status_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        head.addWidget(self.name_label)
+        head.addStretch(1)
+        head.addWidget(self.status_label)
+        layout.addLayout(head)
+
+        self.bar = QProgressBar()
+        self.bar.setTextVisible(False)
+        self.bar.setRange(0, 100)
+        self.bar.setValue(0)
+        layout.addWidget(self.bar)
+
         self.worker: Optional[FunctionWorker] = None
         self.setCursor(Qt.PointingHandCursor)
-        self._set("idle", self._IDLE)
+        self._set_state("idle", "idle")
 
-    def _set(self, status: str, color: str, tooltip: Optional[str] = None) -> None:
-        self.dot.setStyleSheet(f"color: {color}; font-size: 13px;")
+    # --- state rendering -----------------------------------------------------
+    def _set_state(self, state: str, status: str, tooltip: Optional[str] = None) -> None:
+        """state ∈ {idle, running, done, error}; drives the chunk color via QSS."""
+        if self.bar.property("state") != state:
+            self.bar.setProperty("state", state)
+            self.bar.style().unpolish(self.bar)
+            self.bar.style().polish(self.bar)
+        color = {"error": C_ANOM, "done": C_ACCENT, "running": C_TEXT}.get(state, C_MUTED)
+        self.status_label.setStyleSheet(f"color: {color}; font-size: 10px;")
+        self.status_label.setText(status)
         self.setToolTip(f"{self._name}: {tooltip or status}")
 
     def mousePressEvent(self, event) -> None:
         if self.worker is not None:
-            self._cancel_clicked()
+            self.cancel()
+            self._set_state("idle", "cancelled")
         super().mousePressEvent(event)
 
-    # --- worker wiring (mirrors the old TaskProgressWidget contract) ---------
+    # --- worker wiring -------------------------------------------------------
     def start(self, worker: FunctionWorker, on_success=None, on_failed=None) -> None:
         self.cancel()
         self.worker = worker
-        self._set("starting…", self._ACTIVE)
+        self.bar.setRange(0, 0)  # busy/indeterminate until the first progress update
+        self._set_state("running", "starting…")
 
         def succeeded(result):
             self._finish_done()
@@ -237,22 +259,24 @@ class TaskDot(QWidget):
 
     def _on_progress(self, done: int, total: int) -> None:
         if total > 0:
-            self._set(f"{done}/{total}", self._ACTIVE)
+            self.bar.setRange(0, total)
+            self.bar.setValue(done)
+            self._set_state("running", f"{done}/{total}")
 
     def _on_message(self, text: str) -> None:
-        self._set(text, self._ACTIVE, tooltip=text)
+        self._set_state("running", text, tooltip=text)
 
     def _finish_done(self) -> None:
-        self._set("done", self._ACTIVE)
+        self.bar.setRange(0, 100)
+        self.bar.setValue(100)
+        self._set_state("done", "done")
         self.worker = None
 
     def _finish_error(self, error: str) -> None:
-        self._set("error", self._ERROR, tooltip=error)
+        self.bar.setRange(0, 100)
+        self.bar.setValue(100)
+        self._set_state("error", "error", tooltip=error)
         self.worker = None
-
-    def _cancel_clicked(self) -> None:
-        self.cancel()
-        self._set("cancelled", self._IDLE)
 
     def cancel(self) -> None:
         if self.worker is not None:
@@ -268,13 +292,19 @@ class TaskDot(QWidget):
             self.worker = None
 
     def set_idle(self, text: str = "idle") -> None:
-        self._set(text, self._IDLE)
+        self.bar.setRange(0, 100)
+        self.bar.setValue(0)
+        self._set_state("idle", text)
 
     def set_done(self, text: str = "done", tooltip: Optional[str] = None) -> None:
-        self._set(text, self._ACTIVE, tooltip=tooltip)
+        self.bar.setRange(0, 100)
+        self.bar.setValue(100)
+        self._set_state("done", text, tooltip=tooltip)
 
     def set_error(self, text: str, tooltip: Optional[str] = None) -> None:
-        self._set(text, self._ERROR, tooltip=tooltip)
+        self.bar.setRange(0, 100)
+        self.bar.setValue(100)
+        self._set_state("error", text, tooltip=tooltip)
 
 
 class PiPContainer(QWidget):
@@ -351,15 +381,16 @@ class EmbryoLabelingApp(QMainWindow):
         self.current_patient_ts = None
         self.current_timepoint = 0
         self.current_depth = 0
-        self.selected_focal_depths: List[str] = []
         self.all_depths_window: Optional[AllDepthsWindow] = None
         self.dashboard_window: Optional[DashboardWindow] = None
         self.timeline_window: Optional["TimelineWindow"] = None
         self.segmentation_window: Optional["SegmentationWindow"] = None
-        self._updating_best_depth_checks = False
 
         # Assisted-labeling state (predictions / OCR / RCNN / anomalies).
         self.selected_model: Optional[str] = DEFAULT_MODEL
+        self.model_is_default = True
+        self._aws_authenticated = False
+        self._aws_status_msg = "AWS sign-in not checked yet."
         self.show_postprocessed = True
         self._pred_arrays: Optional[Dict] = None
         self._ocr_arrays: Optional[Dict] = None
@@ -404,6 +435,9 @@ class EmbryoLabelingApp(QMainWindow):
         self.setAcceptDrops(True)
         self._build_shortcuts()
         self.toggle_roi()
+
+        # Initialize the model status chip + AWS-gated actions from current state.
+        self.refresh_aws_state()
 
     # ------------------------------------------------------------------
     # Cockpit builders
@@ -453,15 +487,10 @@ class EmbryoLabelingApp(QMainWindow):
         self.show_roi_checkbox.setChecked(True)
         self.show_roi_checkbox.setToolTip("Show the ROI inset")
         self.show_roi_checkbox.stateChanged.connect(self.toggle_roi)
-        # RCNN ROI detection is lazy + cached + off the UI thread; when on, the inset
-        # shows a center crop instantly and is replaced by the detected box afterwards.
-        self.auto_detect_roi_checkbox = QCheckBox("Auto-ROI")
-        self.auto_detect_roi_checkbox.setChecked(True)
-        self.auto_detect_roi_checkbox.setToolTip("Auto-detect the embryo ROI with the RCNN detector")
         self.show_all_depths_checkbox = QCheckBox("All depths")
         self.show_all_depths_checkbox.setToolTip("Open a window showing every focal depth at once")
         self.show_all_depths_checkbox.stateChanged.connect(self.toggle_all_depths)
-        for box in (self.show_roi_checkbox, self.auto_detect_roi_checkbox, self.show_all_depths_checkbox):
+        for box in (self.show_roi_checkbox, self.show_all_depths_checkbox):
             row.addWidget(box)
 
         self.segment_btn = QToolButton()
@@ -472,12 +501,13 @@ class EmbryoLabelingApp(QMainWindow):
 
         row.addWidget(self._vsep())
 
-        # Compact background-task indicators (OCR / predictions / ROI boxes).
-        self.task_ocr = TaskDot("OCR")
-        self.task_pred = TaskDot("Pred")
-        self.task_bbox = TaskDot("ROI")
-        for dot in (self.task_ocr, self.task_pred, self.task_bbox):
-            row.addWidget(dot)
+        # Persistent model status chip: shows the active model + a non-default badge,
+        # and the AWS sign-in state. Click to open Setup Models.
+        self.model_chip = QToolButton()
+        self.model_chip.setAutoRaise(True)
+        self.model_chip.setCursor(Qt.PointingHandCursor)
+        self.model_chip.clicked.connect(self.setup_models_dialog)
+        row.addWidget(self.model_chip)
 
         return header
 
@@ -587,30 +617,20 @@ class EmbryoLabelingApp(QMainWindow):
             label_grid.addWidget(chip, index // 2, index % 2)
         layout.addLayout(label_grid)
 
-        layout.addSpacing(6)
-        depths_title = QLabel("BEST DEPTHS")
-        depths_title.setObjectName("RailTitle")
-        layout.addWidget(depths_title)
-        depths_hint = QLabel("up to 3 · white = current view")
-        depths_hint.setStyleSheet(f"color: {C_MUTED}; font-size: 10px;")
-        layout.addWidget(depths_hint)
-
-        self.focal_depth_buttons: List[QPushButton] = []
-        depth_grid = QGridLayout()
-        depth_grid.setSpacing(5)
-        for index, depth in enumerate(ORDERED_FOCAL_DEPTH):
-            chip = QPushButton(depth)
-            chip.setCheckable(True)
-            chip.setProperty("chip", "depth")
-            chip.setProperty("current", "false")
-            chip.setCursor(Qt.PointingHandCursor)
-            chip.toggled.connect(self.update_focal_depth_selection)
-            self.focal_depth_buttons.append(chip)
-            depth_grid.addWidget(chip, index // 2, index % 2)
-        layout.addLayout(depth_grid)
-
         layout.addStretch(1)
 
+        # Background-task progress bars (OCR / predictions / ROI boxes). Auto-started on
+        # patient load; click a running bar to cancel it.
+        tasks_title = QLabel("BACKGROUND TASKS")
+        tasks_title.setObjectName("RailTitle")
+        layout.addWidget(tasks_title)
+        self.task_ocr = TaskProgressBar("OCR")
+        self.task_pred = TaskProgressBar("Pred")
+        self.task_bbox = TaskProgressBar("ROI")
+        for task_bar in (self.task_ocr, self.task_pred, self.task_bbox):
+            layout.addWidget(task_bar)
+
+        layout.addSpacing(6)
         hint = QLabel(
             "← → timepoint   ↑ ↓ depth\n"
             "A accept pred\n"
@@ -666,6 +686,8 @@ class EmbryoLabelingApp(QMainWindow):
         file_menu.addAction(open_action)
 
         tools_menu = self.menuBar().addMenu("Tools")
+        # Keep AWS-dependent actions (Re-run Predictions) in sync with sign-in state.
+        tools_menu.aboutToShow.connect(self.refresh_aws_state)
         dashboard_action = QAction("Dashboard", self)
         dashboard_action.triggered.connect(self.open_dashboard)
         tools_menu.addAction(dashboard_action)
@@ -693,9 +715,9 @@ class EmbryoLabelingApp(QMainWindow):
         predictions_action.triggered.connect(lambda: self.run_predictions(force=False))
         tools_menu.addAction(predictions_action)
 
-        rerun_action = QAction("Re-run Predictions", self)
-        rerun_action.triggered.connect(lambda: self.run_predictions(force=True))
-        tools_menu.addAction(rerun_action)
+        self.rerun_action = QAction("Re-run Predictions…", self)
+        self.rerun_action.triggered.connect(self.rerun_predictions)
+        tools_menu.addAction(self.rerun_action)
 
         detect_rois_action = QAction("Detect ROIs (RCNN)", self)
         detect_rois_action.triggered.connect(self.detect_rois)
@@ -753,6 +775,7 @@ class EmbryoLabelingApp(QMainWindow):
         try:
             self.dataset = DataSet(directory)
             self.update_patient_list()
+            self.ensure_model_ready()
             self.auto_select_first_patient()
             QMessageBox.information(self, "Success", f"Loaded dataset from {directory}")
         except Exception as exc:
@@ -825,7 +848,6 @@ class EmbryoLabelingApp(QMainWindow):
                     self.roi_viewer.clear()
                 self.update_nav_indicators()
                 self.update_label_buttons()
-                self.update_focal_depth_checkboxes()
                 depth_name = self.current_patient_ts.get_depth_name(self.current_depth)
                 self.info_label_bottom.setText(f"No images for depth {depth_name}")
                 self.update_prediction_label()
@@ -842,7 +864,6 @@ class EmbryoLabelingApp(QMainWindow):
 
             self.update_nav_indicators()
             self.update_label_buttons()
-            self.update_focal_depth_checkboxes()
             self.update_info_label()
             self.update_prediction_label()
 
@@ -873,7 +894,6 @@ class EmbryoLabelingApp(QMainWindow):
         bbox_task_running = self.task_bbox.worker is not None
         if (
             not is_cached
-            and self.auto_detect_roi_checkbox.isChecked()
             and not self._roi_detect_failed
             and not bbox_task_running
         ):
@@ -921,13 +941,12 @@ class EmbryoLabelingApp(QMainWindow):
         # Detection failed (e.g. weights/torch missing): stop auto-detecting and tell
         # the user once. Labeling continues with center crops.
         self._roi_detect_failed = True
-        self.auto_detect_roi_checkbox.setChecked(False)
         QMessageBox.warning(
             self,
             "ROI detection unavailable",
             f"RCNN ROI detection failed and was disabled:\n{error}\n\n"
-            "Use Tools > Setup Models to install weights, then re-enable "
-            "'Auto-detect ROI'.",
+            "Use Tools > Setup Models to install weights, then Tools > Detect ROIs "
+            "to retry.",
         )
 
     def _on_roi_worker_finished(self) -> None:
@@ -1046,35 +1065,6 @@ class EmbryoLabelingApp(QMainWindow):
         self.label_buttons.setExclusive(True)
         self.current_patient_ts.set_label(self.current_timepoint, cls)
         self._after_label_change()
-
-    def update_focal_depth_checkboxes(self) -> None:
-        if self.current_patient_ts is None:
-            return
-        self._updating_best_depth_checks = True
-        selected_depths = self.current_patient_ts.get_best_depths(self.current_timepoint)
-        self.selected_focal_depths = selected_depths
-        current_depth_name = self.current_patient_ts.get_depth_name(self.current_depth)
-        for chip in self.focal_depth_buttons:
-            chip.setChecked(chip.text() in selected_depths)
-            self._set_chip_property(chip, "current", chip.text() == current_depth_name)
-        self._updating_best_depth_checks = False
-
-    def update_focal_depth_selection(self) -> None:
-        if self._updating_best_depth_checks or self.current_patient_ts is None:
-            return
-
-        selected_depths = [chip.text() for chip in self.focal_depth_buttons if chip.isChecked()]
-        if len(selected_depths) > 3:
-            sender = self.sender()
-            if isinstance(sender, QPushButton):
-                sender.blockSignals(True)
-                sender.setChecked(False)
-                sender.blockSignals(False)
-            selected_depths = [chip.text() for chip in self.focal_depth_buttons if chip.isChecked()]
-            QMessageBox.warning(self, "Too many depths", "Select at most three focal depths.")
-
-        self.selected_focal_depths = selected_depths
-        self.current_patient_ts.set_best_depths(self.current_timepoint, selected_depths)
 
     # ------------------------------------------------------------------
     # Optional panels/windows
@@ -1212,7 +1202,87 @@ class EmbryoLabelingApp(QMainWindow):
     # ==================================================================
     # Model setup (AWS)
     # ==================================================================
+    def refresh_aws_state(self) -> None:
+        """Re-check AWS sign-in and sync the UI (status chip + AWS-gated actions).
+
+        Cached in ``self._aws_authenticated`` / ``self._aws_status_msg`` so the rest of
+        the UI reads one source of truth instead of shelling out repeatedly.
+        """
+        self._aws_authenticated, self._aws_status_msg = setup_models.auth_status()
+        if hasattr(self, "rerun_action"):
+            self.rerun_action.setEnabled(self._aws_authenticated)
+            self.rerun_action.setToolTip("" if self._aws_authenticated else self._aws_status_msg)
+        self._update_model_chip()
+
+    def select_model(self, model_name: str) -> None:
+        """Make ``model_name`` the active model and refresh the status chip.
+
+        Single setter for the active model so the default/non-default badge stays
+        consistent everywhere it can change.
+        """
+        self.selected_model = model_name
+        self.model_is_default = (model_name == DEFAULT_MODEL)
+        self._update_model_chip()
+
+    def _update_model_chip(self) -> None:
+        if not hasattr(self, "model_chip"):
+            return
+        name = self.selected_model
+        ready = bool(name) and not setup_models.missing_files(name)
+        if self.model_is_default:
+            label = "Model: default"
+            color = C_ACCENT if ready else C_MUTED
+        else:
+            short = (name[:16] + "…") if name and len(name) > 17 else (name or "—")
+            label = f"Model: {short}  ⚠ non-default"
+            color = C_PRED  # orange — draw attention to a non-default model
+        if not ready:
+            label += "  (not downloaded)"
+        self.model_chip.setText(label)
+        self.model_chip.setStyleSheet(f"color: {color}; font-size: 11px;")
+        state = "ready" if ready else "weights not downloaded"
+        self.model_chip.setToolTip(
+            f"{name}\nStatus: {state}\nAWS: {self._aws_status_msg}\n\n"
+            "Click to choose or download a model."
+        )
+
+    def ensure_model_ready(self) -> None:
+        """Detect/select a usable model on dataset load (prompts before downloading).
+
+        Default present → use it silently. Default missing but another local model is
+        ready → use it and flag it as non-default (via the status chip). Nothing ready →
+        offer to download the default if signed in to AWS; otherwise leave the (missing)
+        default selected so the chip shows the situation.
+        """
+        self.refresh_aws_state()
+
+        if not setup_models.missing_files(DEFAULT_MODEL):
+            self.select_model(DEFAULT_MODEL)
+            return
+
+        ready = [m for m in setup_models.local_models() if not setup_models.missing_files(m)]
+        if ready:
+            # A non-default model is ready — use it, and the chip flags it as non-default.
+            self.select_model(ready[0])
+            return
+
+        if self._aws_authenticated:
+            response = QMessageBox.question(
+                self,
+                "Download default model?",
+                "No model weights were found locally.\n\nDownload the default model now?\n"
+                f"({DEFAULT_MODEL})",
+                QMessageBox.Yes | QMessageBox.No,
+            )
+            if response == QMessageBox.Yes:
+                self._download_and_select(DEFAULT_MODEL)
+                return
+
+        # Unauthenticated or declined: keep the (missing) default selected; chip shows it.
+        self.select_model(DEFAULT_MODEL)
+
     def setup_models_dialog(self) -> None:
+        self.refresh_aws_state()
         local = setup_models.local_models()
         fetch_label = "⟳ Fetch model list from S3…"
         items = local + [fetch_label]
@@ -1227,6 +1297,8 @@ class EmbryoLabelingApp(QMainWindow):
         if not ok:
             return
         if choice == fetch_label:
+            if not self._require_aws_or_warn():
+                return
             self._fetch_and_choose_s3_model()
             return
         self._select_model(choice)
@@ -1251,12 +1323,14 @@ class EmbryoLabelingApp(QMainWindow):
     def _select_model(self, model_name: str) -> None:
         missing = setup_models.missing_files(model_name)
         if not missing:
-            self.selected_model = model_name
+            self.select_model(model_name)
             QMessageBox.information(
                 self, "Model ready", f"'{model_name}' is ready for predictions."
             )
             return
 
+        if not self._require_aws_or_warn():
+            return
         response = QMessageBox.question(
             self,
             "Download weights?",
@@ -1265,22 +1339,38 @@ class EmbryoLabelingApp(QMainWindow):
         )
         if response != QMessageBox.Yes:
             return
+        self._download_and_select(model_name)
 
+    def _download_and_select(self, model_name: str) -> None:
+        """Download ``model_name`` (+ rcnn.pt) from S3, then make it the active model."""
         def job(progress_cb, message_cb, should_cancel):
             return setup_models.download_model(
                 model_name, progress_cb=message_cb, should_cancel=should_cancel
             )
 
         def on_success(_downloaded):
-            self.selected_model = model_name
+            self.select_model(model_name)
             QMessageBox.information(
                 self, "Download complete", f"'{model_name}' is ready for predictions."
             )
 
         self._run_worker(f"Download {model_name}", job, on_success, determinate=False)
 
+    def _require_aws_or_warn(self) -> bool:
+        """True if signed in to AWS; otherwise show the guidance message and return False."""
+        self.refresh_aws_state()
+        if self._aws_authenticated:
+            return True
+        QMessageBox.information(self, "AWS sign-in required", self._aws_status_msg)
+        return False
+
     def _ensure_model_selected(self) -> Optional[str]:
-        """Return a ready-to-use model name, prompting if needed (None if unavailable)."""
+        """Return a ready-to-use model name, prompting if needed (None if unavailable).
+
+        Offline-friendly: only considers models whose weights are already present, so
+        ``Run Predictions`` works without AWS. Use ``rerun_predictions`` to pull a model
+        from S3.
+        """
         if self.selected_model and not setup_models.missing_files(self.selected_model):
             return self.selected_model
         ready = [m for m in setup_models.local_models() if not setup_models.missing_files(m)]
@@ -1288,20 +1378,72 @@ class EmbryoLabelingApp(QMainWindow):
             QMessageBox.information(
                 self,
                 "No model available",
-                "No local model has all required weights. Use Tools > Setup Models to "
+                "No local model has all required weights. Use Tools ▸ Setup Models to "
                 "download one (needs AWS access to cfai-model-weights).",
             )
             return None
         if len(ready) == 1:
-            self.selected_model = ready[0]
+            self.select_model(ready[0])
             return ready[0]
         choice, ok = QInputDialog.getItem(
             self, "Select Model", "Model to use for predictions:", ready, 0, False
         )
         if not ok:
             return None
-        self.selected_model = choice
+        self.select_model(choice)
         return choice
+
+    def rerun_predictions(self) -> None:
+        """Re-run predictions with a model chosen from S3 (default first, then bucket).
+
+        AWS-gated: the menu action is disabled when signed out, and this guards again in
+        case sign-in lapsed. The chosen model is downloaded first if not already local.
+        """
+        if self.current_patient_ts is None:
+            QMessageBox.warning(self, "No patient selected", "Select a patient first.")
+            return
+        if not self._require_aws_or_warn():
+            return
+        patient = self.current_patient_ts
+
+        def job(progress_cb, message_cb, should_cancel):
+            message_cb("Listing models in s3://cfai-model-weights …")
+            return setup_models.list_s3_models()
+
+        def on_success(s3_models):
+            # Default first, then the S3 bucket models (de-duplicated against it).
+            items = [DEFAULT_MODEL] + [m for m in s3_models if m != DEFAULT_MODEL]
+            labels = [f"{m}  (default)" if m == DEFAULT_MODEL else m for m in items]
+            choice, ok = QInputDialog.getItem(
+                self,
+                "Re-run Predictions",
+                "Model to use (downloaded from S3 if not present locally):",
+                labels,
+                0,
+                False,
+            )
+            if not ok:
+                return
+            self._run_predictions_with_model(patient, items[labels.index(choice)])
+
+        self._run_worker("Fetch S3 model list", job, on_success, determinate=False)
+
+    def _run_predictions_with_model(self, patient, model_name: str) -> None:
+        """Download ``model_name`` if missing, then (re)compute predictions for ``patient``."""
+        self.select_model(model_name)
+        if setup_models.missing_files(model_name) and not self._require_aws_or_warn():
+            return
+
+        def job(progress_cb, message_cb, should_cancel):
+            if setup_models.missing_files(model_name):
+                setup_models.download_model(
+                    model_name, progress_cb=message_cb, should_cancel=should_cancel
+                )
+            return predmod.compute_and_save_predictions(
+                patient, model_name, progress_cb=progress_cb, should_cancel=should_cancel
+            )
+
+        self._launch_task(self.task_pred, patient, job)
 
     # ==================================================================
     # Background tasks: OCR / predictions / ROI bbox (Phases 2, 3, 4)
@@ -1804,19 +1946,15 @@ class DashboardWindow(QMainWindow):
 
         total_timepoints = 0
         total_timepoint_labeled = 0
-        total_best_depth_complete = 0
 
         for patient in self.dataset.get_patient_series():
             n_timepoints = patient.num_timepoints()
             timepoint_labels = patient.labels.get("timepoint_labels", {})
-            best_depths = patient.labels.get("best_depths", {})
 
             n_tp = len(timepoint_labels)
-            n_best = sum(1 for value in best_depths.values() if isinstance(value, list) and len(value) == 3)
 
             total_timepoints += n_timepoints
             total_timepoint_labeled += n_tp
-            total_best_depth_complete += n_best
 
             for label in timepoint_labels.values():
                 class_counts[label] += 1
@@ -1829,20 +1967,16 @@ class DashboardWindow(QMainWindow):
                     "patient_id": patient.patient_id,
                     "num_timepoints": n_timepoints,
                     "timepoint_pct": 100.0 * n_tp / n_timepoints if n_timepoints else 0.0,
-                    "best_depth_pct": 100.0 * n_best / n_timepoints if n_timepoints else 0.0,
                 }
             )
 
         overall_timepoint_pct = 100.0 * total_timepoint_labeled / total_timepoints if total_timepoints else 0.0
-        overall_best_depth_pct = 100.0 * total_best_depth_complete / total_timepoints if total_timepoints else 0.0
 
         summary_text = (
             f"Dataset: {self.dataset.root_directory}\n"
             f"Patients: {self.dataset.num_patients()} | Timepoints: {total_timepoints}\n"
             f"Timepoint labels complete: {total_timepoint_labeled}/{total_timepoints} "
-            f"({overall_timepoint_pct:.1f}%)\n"
-            f"Best-depth labels complete: {total_best_depth_complete}/{total_timepoints} "
-            f"({overall_best_depth_pct:.1f}%)"
+            f"({overall_timepoint_pct:.1f}%)"
         )
 
         return {
@@ -1851,20 +1985,16 @@ class DashboardWindow(QMainWindow):
             "events": events,
             "summary_text": summary_text,
             "overall_timepoint_pct": overall_timepoint_pct,
-            "overall_best_depth_pct": overall_best_depth_pct,
         }
 
     def _make_progress_bar_chart(self, summary: Dict):
         labels = ["OVERALL"] + [row["patient_id"] for row in summary["patient_rows"]]
         timepoint_values = [summary["overall_timepoint_pct"]] + [row["timepoint_pct"] for row in summary["patient_rows"]]
-        best_depth_values = [summary["overall_best_depth_pct"]] + [row["best_depth_pct"] for row in summary["patient_rows"]]
 
         x = np.arange(len(labels))
-        width = 0.38
 
         fig, ax = plt.subplots(figsize=(12, 5))
-        ax.bar(x - width / 2, timepoint_values, width, label="Timepoint label")
-        ax.bar(x + width / 2, best_depth_values, width, label="Best depths")
+        ax.bar(x, timepoint_values, 0.6, label="Timepoint label")
         ax.set_title("Labeling Completion by Patient")
         ax.set_ylabel("Complete (%)")
         ax.set_ylim(0, 100)
@@ -1892,7 +2022,7 @@ class DashboardWindow(QMainWindow):
         for event in summary["events"]:
             if event.get("action") != "created":
                 continue
-            if event.get("event_type") == "best_depths" and not event.get("complete", False):
+            if event.get("event_type") != "timepoint_label":
                 continue
             timestamp = event.get("timestamp")
             if not timestamp:
@@ -1901,7 +2031,7 @@ class DashboardWindow(QMainWindow):
                 dt = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
             except ValueError:
                 continue
-            created_events.append((dt.date(), event.get("event_type")))
+            created_events.append(dt.date())
 
         fig, ax = plt.subplots(figsize=(12, 4))
         if not created_events:
@@ -1911,28 +2041,20 @@ class DashboardWindow(QMainWindow):
             fig.tight_layout()
             return fig
 
-        first_day = min(day for day, _ in created_events)
-        daily_counts = defaultdict(lambda: {"timepoint_label": 0, "best_depths": 0})
-        for day, event_type in created_events:
-            daily_counts[(day - first_day).days][event_type] += 1
+        first_day = min(created_events)
+        daily_counts = defaultdict(int)
+        for day in created_events:
+            daily_counts[(day - first_day).days] += 1
 
         max_day = max(daily_counts.keys())
         xs = list(range(max_day + 1))
         tp_cumulative = []
-        bd_cumulative = []
-        total_cumulative = []
         tp_running = 0
-        bd_running = 0
         for day_index in xs:
-            tp_running += daily_counts[day_index]["timepoint_label"]
-            bd_running += daily_counts[day_index]["best_depths"]
+            tp_running += daily_counts[day_index]
             tp_cumulative.append(tp_running)
-            bd_cumulative.append(bd_running)
-            total_cumulative.append(tp_running + bd_running)
 
         ax.plot(xs, tp_cumulative, marker="o", label="Timepoint labels")
-        ax.plot(xs, bd_cumulative, marker="o", label="Best-depth labels")
-        ax.plot(xs, total_cumulative, marker="o", label="Aggregate")
         ax.set_title("Cumulative Labeling Progress Over Time")
         ax.set_xlabel("Days since first label was created")
         ax.set_ylabel("Number of labels created")
