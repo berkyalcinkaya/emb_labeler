@@ -1632,6 +1632,7 @@ class EmbryoLabelingApp(QMainWindow):
             return
         name = self.selected_model
         ready = bool(name) and not setup_models.missing_files(name)
+        rcnn_ok = setup_models.rcnn_present()
         if self.model_is_default:
             label = "Model: default"
             color = C_ACCENT if ready else C_MUTED
@@ -1641,11 +1642,14 @@ class EmbryoLabelingApp(QMainWindow):
             color = C_PRED  # orange — draw attention to a non-default model
         if not ready:
             label += "  (not downloaded)"
+        if not ready or not rcnn_ok:
+            color = C_ANOM  # red — a required model is missing
         self.model_chip.setText(label)
         self.model_chip.setStyleSheet(f"color: {color}; font-size: 11px;")
         state = "ready" if ready else "weights not downloaded"
+        rcnn_state = "ready" if rcnn_ok else "weights not downloaded"
         self.model_chip.setToolTip(
-            f"{name}\nStatus: {state}\nAWS: {self._aws_status_msg}\n\n"
+            f"{name}\nStatus: {state}\nRCNN: {rcnn_state}\nAWS: {self._aws_status_msg}\n\n"
             "Click to choose or download a model."
         )
 
