@@ -3162,6 +3162,7 @@ class SegImageDraw(pg.ImageItem):
         self.setOpts(axisOrder="row-major")
         self.setZValue(10)
         self._last_pos = None
+        self._path: List[Tuple[int, int]] = []   # drag path (x, y) for auto-fill
 
     def render_mask(self) -> None:
         mask = self.window.mask
@@ -3206,15 +3207,19 @@ class SegImageDraw(pg.ImageItem):
             self.window.begin_stroke()
             self._stamp_at(int(ev.pos().y()), int(ev.pos().x()))
             self._last_pos = ev.pos()
+            self._path = [(int(ev.pos().x()), int(ev.pos().y()))]
             self.render_mask()       # active pane updates live for a responsive brush
         elif ev.isFinish():
             self._last_pos = None
+            self._fill_path()        # fill the loop's interior when auto-fill is on
+            self._path = []
             self.window.end_stroke()
             self.window.render_overlays()   # sync every depth pane at stroke end
         else:
             if self._last_pos is not None:
                 self._stamp_line(self._last_pos, ev.pos())
             self._last_pos = ev.pos()
+            self._path.append((int(ev.pos().x()), int(ev.pos().y())))
             self.render_mask()
 
     # --- brush stamping ---------------------------------------------------
@@ -3238,6 +3243,27 @@ class SegImageDraw(pg.ImageItem):
             return
         sub = kernel[mr0 - r0: mr1 - r0, mc0 - c0: mc1 - c0]
         mask[mr0:mr1, mc0:mc1][sub] = self.window.current_class_index
+
+    def _fill_path(self) -> None:
+        """Fill the interior of the just-drawn loop with the active class.
+
+        Rasterizes the recorded drag path as a *closed* polygon (skimage auto-connects
+        the last point back to the first), mirroring yeastvision's Outline fill so an
+        imperfectly closed circle still fills. No-op unless auto-fill is on, the active
+        class is a structure (not the eraser), and the path has enough points to enclose
+        an area.
+        """
+        if not self.window.autofill or self.window.current_class_index == 0:
+            return
+        if len(self._path) < 3:
+            return
+        from skimage.draw import polygon as sk_polygon
+
+        mask = self.window.mask
+        xs = [p[0] for p in self._path]
+        ys = [p[1] for p in self._path]
+        rr, cc = sk_polygon(ys, xs, shape=mask.shape)
+        mask[rr, cc] = self.window.current_class_index
 
 
 class SegDepthPane:
@@ -3304,6 +3330,11 @@ class SegmentationWindow(QMainWindow):
         self.brush_kernel = self._make_kernel(self.brush_size)
         self.lut = _seg_lut(self.active_stage)
         self.mask: Optional[np.ndarray] = None
+
+        # Auto-fill mode: when on, a painted loop has its interior filled at stroke
+        # release (closed-polygon rasterization of the drag path, like yeastvision's
+        # Outline brush). Applies to structure paints only, not the eraser.
+        self.autofill = False
 
         # Canvas can show a single focal depth (default) or every populated depth at
         # once ("all depths"), painting the same shared mask from any pane.
@@ -3376,7 +3407,8 @@ class SegmentationWindow(QMainWindow):
 
         self.hint_label = QLabel(
             "left-drag paint · right-drag pan · wheel zoom    |    "
-            "1/2/3 structure · 0/E erase · [ ] brush · Ctrl+Z/Ctrl+Shift+Z undo/redo · "
+            "1/2/3 structure · 0/E erase · [ ] brush · F auto-fill loop · "
+            "Ctrl+Z/Ctrl+Shift+Z undo/redo · "
             "Ctrl+click (or V) select mass · ⌫ delete · Esc clear · "
             "← → frame · ↑ ↓ depth · A all depths · P/B jump to tPN/tB · S switch stage"
         )
@@ -3473,6 +3505,17 @@ class SegmentationWindow(QMainWindow):
         self.brush_spin.valueChanged.connect(self.set_brush_size)
         row.addWidget(self.brush_spin)
 
+        # Auto-fill toggle: fill the interior of a drawn loop on stroke release.
+        self.autofill_btn = QToolButton()
+        self.autofill_btn.setText("◍ fill")
+        self.autofill_btn.setCheckable(True)
+        self.autofill_btn.setToolTip(
+            "Auto-fill: filling a drawn loop's interior on release — ideal for tracing "
+            "the pronucleus or zona pellucida (F)"
+        )
+        self.autofill_btn.clicked.connect(lambda checked: self.toggle_autofill(checked))
+        row.addWidget(self.autofill_btn)
+
         # Select mass / undo / redo / clear.
         self.select_btn = QToolButton()
         self.select_btn.setText("⊙ select")
@@ -3524,6 +3567,7 @@ class SegmentationWindow(QMainWindow):
             add("Ctrl+S", self._flush),
             add("S", self.toggle_stage),
             add("A", self.toggle_all_depths),
+            add("F", self.toggle_autofill),
             add("V", self.toggle_select_mode),
             add("P", lambda: self.jump_to_stage("tPN")),
             add("B", lambda: self.jump_to_stage("tB")),
@@ -3921,6 +3965,18 @@ class SegmentationWindow(QMainWindow):
     # ------------------------------------------------------------------
     # Mass selection + delete (Ctrl+click / Select mode → Backspace)
     # ------------------------------------------------------------------
+    def toggle_autofill(self, on: Optional[bool] = None) -> None:
+        self.autofill = (not self.autofill) if on is None else bool(on)
+        if self.autofill_btn.isChecked() != self.autofill:
+            self.autofill_btn.blockSignals(True)
+            self.autofill_btn.setChecked(self.autofill)
+            self.autofill_btn.blockSignals(False)
+        self.statusBar().showMessage(
+            "Auto-fill ON — drawn loops fill on release"
+            if self.autofill else "Auto-fill off",
+            3000,
+        )
+
     def toggle_select_mode(self, on: Optional[bool] = None) -> None:
         self.select_mode = (not self.select_mode) if on is None else bool(on)
         if self.select_btn.isChecked() != self.select_mode:
