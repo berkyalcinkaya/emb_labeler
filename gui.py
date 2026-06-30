@@ -386,6 +386,9 @@ class EmbryoLabelingApp(QMainWindow):
 
         # Assisted-labeling state (predictions / OCR / RCNN / anomalies).
         self.selected_model: Optional[str] = DEFAULT_MODEL
+        self.model_is_default = True
+        self._aws_authenticated = False
+        self._aws_status_msg = "AWS sign-in not checked yet."
         self.show_postprocessed = True
         self._pred_arrays: Optional[Dict] = None
         self._ocr_arrays: Optional[Dict] = None
@@ -430,6 +433,9 @@ class EmbryoLabelingApp(QMainWindow):
         self.setAcceptDrops(True)
         self._build_shortcuts()
         self.toggle_roi()
+
+        # Initialize the model status chip + AWS-gated actions from current state.
+        self.refresh_aws_state()
 
     # ------------------------------------------------------------------
     # Cockpit builders
@@ -484,6 +490,16 @@ class EmbryoLabelingApp(QMainWindow):
         self.show_all_depths_checkbox.stateChanged.connect(self.toggle_all_depths)
         for box in (self.show_roi_checkbox, self.show_all_depths_checkbox):
             row.addWidget(box)
+
+        row.addWidget(self._vsep())
+
+        # Persistent model status chip: shows the active model + a non-default badge,
+        # and the AWS sign-in state. Click to open Setup Models.
+        self.model_chip = QToolButton()
+        self.model_chip.setAutoRaise(True)
+        self.model_chip.setCursor(Qt.PointingHandCursor)
+        self.model_chip.clicked.connect(self.setup_models_dialog)
+        row.addWidget(self.model_chip)
 
         return header
 
@@ -662,6 +678,8 @@ class EmbryoLabelingApp(QMainWindow):
         file_menu.addAction(open_action)
 
         tools_menu = self.menuBar().addMenu("Tools")
+        # Keep AWS-dependent actions (Re-run Predictions) in sync with sign-in state.
+        tools_menu.aboutToShow.connect(self.refresh_aws_state)
         dashboard_action = QAction("Dashboard", self)
         dashboard_action.triggered.connect(self.open_dashboard)
         tools_menu.addAction(dashboard_action)
@@ -684,9 +702,9 @@ class EmbryoLabelingApp(QMainWindow):
         predictions_action.triggered.connect(lambda: self.run_predictions(force=False))
         tools_menu.addAction(predictions_action)
 
-        rerun_action = QAction("Re-run Predictions", self)
-        rerun_action.triggered.connect(lambda: self.run_predictions(force=True))
-        tools_menu.addAction(rerun_action)
+        self.rerun_action = QAction("Re-run Predictions…", self)
+        self.rerun_action.triggered.connect(self.rerun_predictions)
+        tools_menu.addAction(self.rerun_action)
 
         detect_rois_action = QAction("Detect ROIs (RCNN)", self)
         detect_rois_action.triggered.connect(self.detect_rois)
@@ -744,6 +762,7 @@ class EmbryoLabelingApp(QMainWindow):
         try:
             self.dataset = DataSet(directory)
             self.update_patient_list()
+            self.ensure_model_ready()
             self.auto_select_first_patient()
             QMessageBox.information(self, "Success", f"Loaded dataset from {directory}")
         except Exception as exc:
@@ -1151,7 +1170,87 @@ class EmbryoLabelingApp(QMainWindow):
     # ==================================================================
     # Model setup (AWS)
     # ==================================================================
+    def refresh_aws_state(self) -> None:
+        """Re-check AWS sign-in and sync the UI (status chip + AWS-gated actions).
+
+        Cached in ``self._aws_authenticated`` / ``self._aws_status_msg`` so the rest of
+        the UI reads one source of truth instead of shelling out repeatedly.
+        """
+        self._aws_authenticated, self._aws_status_msg = setup_models.auth_status()
+        if hasattr(self, "rerun_action"):
+            self.rerun_action.setEnabled(self._aws_authenticated)
+            self.rerun_action.setToolTip("" if self._aws_authenticated else self._aws_status_msg)
+        self._update_model_chip()
+
+    def select_model(self, model_name: str) -> None:
+        """Make ``model_name`` the active model and refresh the status chip.
+
+        Single setter for the active model so the default/non-default badge stays
+        consistent everywhere it can change.
+        """
+        self.selected_model = model_name
+        self.model_is_default = (model_name == DEFAULT_MODEL)
+        self._update_model_chip()
+
+    def _update_model_chip(self) -> None:
+        if not hasattr(self, "model_chip"):
+            return
+        name = self.selected_model
+        ready = bool(name) and not setup_models.missing_files(name)
+        if self.model_is_default:
+            label = "Model: default"
+            color = C_ACCENT if ready else C_MUTED
+        else:
+            short = (name[:16] + "…") if name and len(name) > 17 else (name or "—")
+            label = f"Model: {short}  ⚠ non-default"
+            color = C_PRED  # orange — draw attention to a non-default model
+        if not ready:
+            label += "  (not downloaded)"
+        self.model_chip.setText(label)
+        self.model_chip.setStyleSheet(f"color: {color}; font-size: 11px;")
+        state = "ready" if ready else "weights not downloaded"
+        self.model_chip.setToolTip(
+            f"{name}\nStatus: {state}\nAWS: {self._aws_status_msg}\n\n"
+            "Click to choose or download a model."
+        )
+
+    def ensure_model_ready(self) -> None:
+        """Detect/select a usable model on dataset load (prompts before downloading).
+
+        Default present → use it silently. Default missing but another local model is
+        ready → use it and flag it as non-default (via the status chip). Nothing ready →
+        offer to download the default if signed in to AWS; otherwise leave the (missing)
+        default selected so the chip shows the situation.
+        """
+        self.refresh_aws_state()
+
+        if not setup_models.missing_files(DEFAULT_MODEL):
+            self.select_model(DEFAULT_MODEL)
+            return
+
+        ready = [m for m in setup_models.local_models() if not setup_models.missing_files(m)]
+        if ready:
+            # A non-default model is ready — use it, and the chip flags it as non-default.
+            self.select_model(ready[0])
+            return
+
+        if self._aws_authenticated:
+            response = QMessageBox.question(
+                self,
+                "Download default model?",
+                "No model weights were found locally.\n\nDownload the default model now?\n"
+                f"({DEFAULT_MODEL})",
+                QMessageBox.Yes | QMessageBox.No,
+            )
+            if response == QMessageBox.Yes:
+                self._download_and_select(DEFAULT_MODEL)
+                return
+
+        # Unauthenticated or declined: keep the (missing) default selected; chip shows it.
+        self.select_model(DEFAULT_MODEL)
+
     def setup_models_dialog(self) -> None:
+        self.refresh_aws_state()
         local = setup_models.local_models()
         fetch_label = "⟳ Fetch model list from S3…"
         items = local + [fetch_label]
@@ -1166,6 +1265,8 @@ class EmbryoLabelingApp(QMainWindow):
         if not ok:
             return
         if choice == fetch_label:
+            if not self._require_aws_or_warn():
+                return
             self._fetch_and_choose_s3_model()
             return
         self._select_model(choice)
@@ -1190,12 +1291,14 @@ class EmbryoLabelingApp(QMainWindow):
     def _select_model(self, model_name: str) -> None:
         missing = setup_models.missing_files(model_name)
         if not missing:
-            self.selected_model = model_name
+            self.select_model(model_name)
             QMessageBox.information(
                 self, "Model ready", f"'{model_name}' is ready for predictions."
             )
             return
 
+        if not self._require_aws_or_warn():
+            return
         response = QMessageBox.question(
             self,
             "Download weights?",
@@ -1204,22 +1307,38 @@ class EmbryoLabelingApp(QMainWindow):
         )
         if response != QMessageBox.Yes:
             return
+        self._download_and_select(model_name)
 
+    def _download_and_select(self, model_name: str) -> None:
+        """Download ``model_name`` (+ rcnn.pt) from S3, then make it the active model."""
         def job(progress_cb, message_cb, should_cancel):
             return setup_models.download_model(
                 model_name, progress_cb=message_cb, should_cancel=should_cancel
             )
 
         def on_success(_downloaded):
-            self.selected_model = model_name
+            self.select_model(model_name)
             QMessageBox.information(
                 self, "Download complete", f"'{model_name}' is ready for predictions."
             )
 
         self._run_worker(f"Download {model_name}", job, on_success, determinate=False)
 
+    def _require_aws_or_warn(self) -> bool:
+        """True if signed in to AWS; otherwise show the guidance message and return False."""
+        self.refresh_aws_state()
+        if self._aws_authenticated:
+            return True
+        QMessageBox.information(self, "AWS sign-in required", self._aws_status_msg)
+        return False
+
     def _ensure_model_selected(self) -> Optional[str]:
-        """Return a ready-to-use model name, prompting if needed (None if unavailable)."""
+        """Return a ready-to-use model name, prompting if needed (None if unavailable).
+
+        Offline-friendly: only considers models whose weights are already present, so
+        ``Run Predictions`` works without AWS. Use ``rerun_predictions`` to pull a model
+        from S3.
+        """
         if self.selected_model and not setup_models.missing_files(self.selected_model):
             return self.selected_model
         ready = [m for m in setup_models.local_models() if not setup_models.missing_files(m)]
@@ -1227,20 +1346,72 @@ class EmbryoLabelingApp(QMainWindow):
             QMessageBox.information(
                 self,
                 "No model available",
-                "No local model has all required weights. Use Tools > Setup Models to "
+                "No local model has all required weights. Use Tools ▸ Setup Models to "
                 "download one (needs AWS access to cfai-model-weights).",
             )
             return None
         if len(ready) == 1:
-            self.selected_model = ready[0]
+            self.select_model(ready[0])
             return ready[0]
         choice, ok = QInputDialog.getItem(
             self, "Select Model", "Model to use for predictions:", ready, 0, False
         )
         if not ok:
             return None
-        self.selected_model = choice
+        self.select_model(choice)
         return choice
+
+    def rerun_predictions(self) -> None:
+        """Re-run predictions with a model chosen from S3 (default first, then bucket).
+
+        AWS-gated: the menu action is disabled when signed out, and this guards again in
+        case sign-in lapsed. The chosen model is downloaded first if not already local.
+        """
+        if self.current_patient_ts is None:
+            QMessageBox.warning(self, "No patient selected", "Select a patient first.")
+            return
+        if not self._require_aws_or_warn():
+            return
+        patient = self.current_patient_ts
+
+        def job(progress_cb, message_cb, should_cancel):
+            message_cb("Listing models in s3://cfai-model-weights …")
+            return setup_models.list_s3_models()
+
+        def on_success(s3_models):
+            # Default first, then the S3 bucket models (de-duplicated against it).
+            items = [DEFAULT_MODEL] + [m for m in s3_models if m != DEFAULT_MODEL]
+            labels = [f"{m}  (default)" if m == DEFAULT_MODEL else m for m in items]
+            choice, ok = QInputDialog.getItem(
+                self,
+                "Re-run Predictions",
+                "Model to use (downloaded from S3 if not present locally):",
+                labels,
+                0,
+                False,
+            )
+            if not ok:
+                return
+            self._run_predictions_with_model(patient, items[labels.index(choice)])
+
+        self._run_worker("Fetch S3 model list", job, on_success, determinate=False)
+
+    def _run_predictions_with_model(self, patient, model_name: str) -> None:
+        """Download ``model_name`` if missing, then (re)compute predictions for ``patient``."""
+        self.select_model(model_name)
+        if setup_models.missing_files(model_name) and not self._require_aws_or_warn():
+            return
+
+        def job(progress_cb, message_cb, should_cancel):
+            if setup_models.missing_files(model_name):
+                setup_models.download_model(
+                    model_name, progress_cb=message_cb, should_cancel=should_cancel
+                )
+            return predmod.compute_and_save_predictions(
+                patient, model_name, progress_cb=progress_cb, should_cancel=should_cancel
+            )
+
+        self._launch_task(self.task_pred, patient, job)
 
     # ==================================================================
     # Background tasks: OCR / predictions / ROI bbox (Phases 2, 3, 4)
