@@ -388,6 +388,23 @@ class PatientTimeSeries:
         self.save_labels()
         self.save_label_metadata()
 
+    def clear_label(self, timepoint: int) -> None:
+        """Remove a human label for ``timepoint`` (undo), recording the change."""
+        key = str(timepoint)
+        previous = self.labels["timepoint_labels"].pop(key, None)
+        if previous is None:
+            return
+        self._append_metadata_event(
+            event_type="timepoint_label",
+            timepoint=timepoint,
+            value=None,
+            previous_value=previous,
+            action="removed",
+            complete=True,
+        )
+        self.save_labels()
+        self.save_label_metadata()
+
     def get_label(self, timepoint: int) -> Optional[str]:
         return self.labels["timepoint_labels"].get(str(timepoint))
 

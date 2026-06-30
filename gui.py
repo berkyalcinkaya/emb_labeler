@@ -571,10 +571,12 @@ class EmbryoLabelingApp(QMainWindow):
         self._pred_arrays: Optional[Dict] = None
         self._ocr_arrays: Optional[Dict] = None
         self._anomaly_cache: Optional[Dict] = None
-        # Anomaly types the user has opted to surface (off by default — these two are
-        # noisy and rarely actionable). Driven by the checkboxes beneath the timeline.
+        # Anomaly types the user has opted to surface. Decode/low-confidence are noisy and
+        # rarely actionable so they default off; short-stage is usually worth seeing so it
+        # defaults on. Driven by the checkboxes beneath the timeline.
         self._show_decode_changed = False
         self._show_low_confidence = False
+        self._show_short_stage = True
 
         # Per-embryo navigation state (timepoint + focal depth), keyed by patient
         # directory, so toggling between loaded embryos returns each to where it was
@@ -798,7 +800,17 @@ class EmbryoLabelingApp(QMainWindow):
             "Surface timepoints where the prediction's max probability is low"
         )
         self.filter_lowconf_checkbox.toggled.connect(self._on_anomaly_filter_toggled)
-        for box in (self.filter_decode_checkbox, self.filter_lowconf_checkbox):
+        self.filter_shortstage_checkbox = QCheckBox("short stage")
+        self.filter_shortstage_checkbox.setChecked(True)
+        self.filter_shortstage_checkbox.setToolTip(
+            "Surface postprocessed stages that last only a frame or two"
+        )
+        self.filter_shortstage_checkbox.toggled.connect(self._on_anomaly_filter_toggled)
+        for box in (
+            self.filter_decode_checkbox,
+            self.filter_lowconf_checkbox,
+            self.filter_shortstage_checkbox,
+        ):
             box.setStyleSheet(f"color: {C_MUTED}; font-size: 10px;")
             filters.addWidget(box)
         filters.addStretch(1)
@@ -808,6 +820,7 @@ class EmbryoLabelingApp(QMainWindow):
     def _on_anomaly_filter_toggled(self, _checked: bool) -> None:
         self._show_decode_changed = self.filter_decode_checkbox.isChecked()
         self._show_low_confidence = self.filter_lowconf_checkbox.isChecked()
+        self._show_short_stage = self.filter_shortstage_checkbox.isChecked()
         self.update_prediction_label()
         for widget in self._timeline_widgets():
             widget.refresh()
@@ -819,6 +832,8 @@ class EmbryoLabelingApp(QMainWindow):
             suppressed.add(anomalies.SIGNAL_DECODE_CHANGED)
         if not self._show_low_confidence:
             suppressed.add(anomalies.SIGNAL_LOW_CONFIDENCE)
+        if not self._show_short_stage:
+            suppressed.add(anomalies.SIGNAL_SHORT_STAGE)
         return suppressed
 
     def _build_rail(self) -> QWidget:
@@ -889,7 +904,7 @@ class EmbryoLabelingApp(QMainWindow):
             "⌘← ⌘→ stage boundary\n"
             "A accept pred · F accept all\n"
             "⌘F fill between labels\n"
-            "N / P next/prev anomaly"
+            "click/key again to clear label"
         )
         hint.setStyleSheet(f"color: {C_MUTED}; font-size: 10px;")
         layout.addWidget(hint)
@@ -931,10 +946,6 @@ class EmbryoLabelingApp(QMainWindow):
         self.shortcut_fill_between.activated.connect(self.fill_between_labels)
         self.shortcut_accept_pred = QShortcut(QtCore.Qt.Key_A, self)
         self.shortcut_accept_pred.activated.connect(self.accept_prediction_current)
-        self.shortcut_next_anomaly = QShortcut(QtCore.Qt.Key_N, self)
-        self.shortcut_next_anomaly.activated.connect(self.goto_next_anomaly)
-        self.shortcut_prev_anomaly = QShortcut(QtCore.Qt.Key_P, self)
-        self.shortcut_prev_anomaly.activated.connect(self.goto_prev_anomaly)
 
     def _build_menu(self) -> None:
         file_menu = self.menuBar().addMenu("File")
@@ -1008,13 +1019,6 @@ class EmbryoLabelingApp(QMainWindow):
         accept_current_action = QAction("Accept prediction (current)  (A)", self)
         accept_current_action.triggered.connect(self.accept_prediction_current)
         assist_menu.addAction(accept_current_action)
-        assist_menu.addSeparator()
-        next_anom_action = QAction("Next anomaly  (N)", self)
-        next_anom_action.triggered.connect(self.goto_next_anomaly)
-        assist_menu.addAction(next_anom_action)
-        prev_anom_action = QAction("Previous anomaly  (P)", self)
-        prev_anom_action.triggered.connect(self.goto_prev_anomaly)
-        assist_menu.addAction(prev_anom_action)
 
     # ------------------------------------------------------------------
     # Dataset loading
@@ -1443,12 +1447,20 @@ class EmbryoLabelingApp(QMainWindow):
             self._set_chip_property(chip, "predicted", cls == predicted)
 
     def select_label_by_class(self, cls: str) -> None:
-        """Apply ``cls`` to the current timepoint (chip click or keyboard hotkey)."""
+        """Set ``cls`` on the current timepoint, or clear it when ``cls`` is already the
+        saved label (chip click or keyboard hotkey toggles the label off)."""
         if self.current_patient_ts is None:
             return
         chip = self.label_chip_by_class.get(cls)
         if chip is None:
             return
+
+        # Re-selecting the current label removes it (undo); otherwise apply the new label.
+        if self.current_patient_ts.get_label(self.current_timepoint) == cls:
+            self.current_patient_ts.clear_label(self.current_timepoint)
+            self._after_label_change()
+            return
+
         self.label_buttons.setExclusive(False)
         for button in self.label_buttons.buttons():
             button.setChecked(button is chip)
@@ -2559,32 +2571,6 @@ class EmbryoLabelingApp(QMainWindow):
         patient.set_label(timepoint, predicted)
         self.statusBar().showMessage(f"Accepted '{predicted}' at t={timepoint}", 3000)
         self._after_label_change()
-
-    def goto_next_anomaly(self) -> None:
-        self._goto_anomaly(forward=True)
-
-    def goto_prev_anomaly(self) -> None:
-        self._goto_anomaly(forward=False)
-
-    def _goto_anomaly(self, forward: bool) -> None:
-        if self.current_patient_ts is None:
-            return
-        anomaly_data = self._get_anomalies()
-        flagged = anomaly_data["flagged"] if anomaly_data else []
-        if not flagged:
-            self.statusBar().showMessage("No anomalies flagged (run predictions/OCR)", 3000)
-            return
-        current = self.current_timepoint
-        if forward:
-            candidates = [t for t in flagged if t > current]
-            target = candidates[0] if candidates else flagged[0]
-        else:
-            candidates = [t for t in flagged if t < current]
-            target = candidates[-1] if candidates else flagged[-1]
-        self.jump_to_timepoint(target)
-        self.statusBar().showMessage(
-            f"Anomaly at t={target} ({len(flagged)} flagged)", 3000
-        )
 
     def closeEvent(self, event) -> None:
         # Persist any unsaved segmentation strokes before teardown.
