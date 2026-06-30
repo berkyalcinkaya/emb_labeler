@@ -1,50 +1,82 @@
 # Embryo Labeler
 
-A PyQt5 + pyqtgraph desktop GUI for labeling time-lapse embryo images across patients, timepoints, and focal depths.
+A keyboard-first desktop GUI for labeling time-lapse embryo images across **patients,
+timepoints, and focal depths** — with optional assisted labeling (OCR clock times, model
+stage predictions, RCNN embryo ROI) and a pixel-level **segmentation pane** for tPN / tB
+masks.
 
-## Expected dataset structure
+![Main labeling window](docs/images/main-window.png)
+
+## Quick start
+
+```bash
+# 1. Clone
+git clone https://github.com/berkyalcinkaya/emb_labeler.git
+cd emb_labeler
+
+# 2a. Install — conda/mamba (recommended; includes the assisted-labeling stack)
+mamba env create -f environment.yml
+mamba activate emb_labeler
+
+# 2b. …or core GUI only, into any Python 3 env
+pip install -r requirements.txt
+
+# 3. Run
+python gui.py
+```
+
+Then **drag an embryo or dataset folder onto the window** (or **File ▸ Open Dataset…**) and
+start labeling — **← →** move through timepoints, **↑ ↓** through focal depths, and a class
+hotkey labels the current frame.
+
+## At a glance
+
+- ⌨️ **Keyboard-first** — arrows navigate, number/letter hotkeys label; minimal clicking.
+- 🔭 **7 focal depths** per timepoint, with a side-by-side **All depths** view.
+- 🤖 **Optional assisted labeling** — per-frame OCR hours, model stage predictions, RCNN
+  embryo ROI, and anomaly flags; accept/fill labels in a keystroke.
+- 🎨 **Pixel-level segmentation** — paint pronucleus masks at tPN and TE/ICM/ZP at tB.
+- 📊 **Dashboard** — labeling completion and class distribution across the dataset.
+- 💾 **Durable writes** — human labels in `labels.json`, computed artifacts in separate
+  per-patient sidecars that are never overwritten.
+
+Assisted features degrade gracefully: if their dependencies or model weights are missing,
+the core labeler still works (center-crop ROIs, no predictions).
+
+## Input data
+
+Point the labeler at **either** a single embryo folder **or** a dataset root containing
+many — both are accepted, and you can drop more folders at any time to add them:
 
 ```text
-root_dataset/
-  patient_001/
-    F-45/*.tif
-    F-30/*.tif
-    F-15/*.tif
-    F0/*.tif
-    F15/*.tif
-    F30/*.tif
-    F45/*.tif
+dataset_root/                 ← drop this for many embryos…
+  patient_001/                ← …or drop a single embryo folder directly
+    F-45/  F-30/  F-15/  F0/  F15/  F30/  F45/
+        *.tif  *.png  *.jpeg  …
   patient_002/
     ...
 ```
 
-Depth folders are read in this order:
+The format is **flexible**:
 
-```python
-["F-45", "F-30", "F-15", "F0", "F15", "F30", "F45"]
-```
+- **Single embryo or a whole dataset** — a folder that directly contains focal-depth
+  subdirs (`F-45 … F45`) loads as one embryo; otherwise its subfolders load as separate
+  embryos.
+- **Any subset of the 7 depths** — e.g. only `F-15, F0, F15`. Missing depths render empty
+  and stay navigable.
+- **Common image formats** — `.tif/.tiff`, `.png`, `.jpeg/.jpg`.
+- **True temporal order** — frames are sorted by their `RUN<n>` index, matching
+  embpred_deploy's timelapse inference / `--postprocess` output (zero-padded names sort
+  identically; files without a `RUN` token fall back to filename order).
 
-Within each depth, frames are ordered by their `RUN<n>` index (matching
-embpred_deploy's sort), so timepoint indices reflect true temporal order and line up
-with embpred's timelapse inference / `--postprocess` output. For zero-padded filenames
-this matches a plain lexical sort; files without a `RUN` token fall back to filename
-order.
-
-## Run
-
-```bash
-pip install -r requirements.txt
-python gui.py
-```
-
-Drag a dataset root folder onto the window (or **File ▸ Open Dataset…**).
+Focal-depth order is fixed: `["F-45", "F-30", "F-15", "F0", "F15", "F30", "F45"]`.
 
 ## Interface
 
 The window is a keyboard-first "cockpit" (dark theme):
 
 - **Header** — patient selector, focal-depth nav (`◂ F0 ▸`), the `t / N` timepoint
-  counter, and view toggles (ROI inset, All depths).
+  counter, and view toggles (ROI inset, All depths, **✏ Segment**).
 - **Main image** — fills the pane with no axis/histogram chrome; the **ROI** is a
   picture-in-picture inset in the corner (toggle with the header **ROI** checkbox).
 - **HUD bar** (under the image) — current timepoint, OCR hour, model prediction +
@@ -165,6 +197,9 @@ Re-run Predictions**, **Detect ROIs**), which act on the embryo currently on scr
 - **Setup Models…** — choose a local classifier checkpoint, or fetch the list from the
   private S3 bucket (`cfai-model-weights`) and download missing weights via the AWS CLI.
   Both the chosen `*.pth` checkpoint and `rcnn.pt` are required.
+
+  ![Setup Models dialog](docs/images/setup-models.png)
+
 - **Run OCR Times** — OCRs the embedded clock (bottom-right of each frame, reference
   depth F0 with retries) and writes per-timepoint hours; failures are interpolated.
 - **Run / Re-run Predictions** — runs inference on the 3-depth subset (`F-15, F0, F15`),
@@ -205,6 +240,8 @@ Beyond per-timepoint classification, the labeler can draw **pixel-level masks** 
 embryo stages. Open it with the header **✏ Segment** button or **Tools ▸ Segmentation
 Pane** (`Ctrl+G`). It is a separate window that shares the current patient with the main
 view; this is a **manual drawing tool only** (no segmentation model/inference).
+
+![Segmentation pane — pronuclei painted at tPN](docs/images/segmentation-pane.png)
 
 - **tPN** — segment the **pronucleus**.
 - **tB** — segment the **trophectoderm (TE)**, **inner cell mass (ICM)**, and **zona

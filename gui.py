@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 from collections import Counter, defaultdict
 from datetime import datetime
@@ -13,8 +14,6 @@ import pyqtgraph as pg
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 from pyqtgraph.Qt import QtCore
-from pyqtgraph.dockarea.Dock import Dock
-from pyqtgraph.dockarea.DockArea import DockArea
 from PyQt5.QtCore import Qt, QThread, QTimer, pyqtSignal
 from PyQt5.QtGui import QColor, QKeySequence, QPalette
 from PyQt5.QtWidgets import (
@@ -1442,7 +1441,6 @@ class EmbryoLabelingApp(QMainWindow):
         if self.all_depths_window is None:
             self.all_depths_window = AllDepthsWindow(
                 self,
-                ORDERED_FOCAL_DEPTH,
                 self.current_patient_ts,
                 self.current_timepoint,
             )
@@ -2544,45 +2542,64 @@ class EmbryoLabelingApp(QMainWindow):
 
 
 class AllDepthsWindow(QMainWindow):
-    """Dockable window showing all focal depths for the current timepoint."""
+    """Window showing every present focal depth for the current timepoint in a
+    responsive grid that adapts to how many depths a patient actually has."""
 
-    def __init__(self, parent, depths: List[str], patient_ts, timepoint: int):
+    def __init__(self, parent, patient_ts, timepoint: int):
         super().__init__(parent)
-        self.depths = depths
         self.patient_ts = patient_ts
         self.timepoint = timepoint
+        # Keyed by actual depth index so absent depths are simply never built.
         self.depth_items: Dict[int, pg.ImageItem] = {}
+        self.depth_plots: Dict[int, pg.PlotItem] = {}
+        self._grid_depths: List[int] = []
 
         self.setWindowTitle("All Focal Depths")
-        self.setGeometry(100, 100, 1400, 900)
+        self.setGeometry(100, 100, 1200, 850)
         self.setStyleSheet(STYLESHEET)
 
         self.central_widget = QWidget()
         self.setCentralWidget(self.central_widget)
         self.layout = QVBoxLayout(self.central_widget)
 
-        self.reset_button = QPushButton("Reset")
-        self.reset_button.clicked.connect(self.reset_docks)
-        self.layout.addWidget(self.reset_button)
+        self.header_label = QLabel("")
+        self.header_label.setAlignment(Qt.AlignCenter)
+        self.header_label.setStyleSheet(
+            f"color: {C_TEXT}; font-size: 14px; font-weight: 600; padding: 6px;"
+        )
+        self.layout.addWidget(self.header_label)
 
-        self.dock_area: Optional[DockArea] = None
-        self._build_dock_area()
+        self.grid_container = QWidget()
+        self.grid_layout = QGridLayout(self.grid_container)
+        self.grid_layout.setSpacing(6)
+        self.layout.addWidget(self.grid_container, stretch=1)
+
         self.update_images(patient_ts, timepoint)
 
-    def _build_dock_area(self) -> None:
-        if self.dock_area is not None:
-            self.layout.removeWidget(self.dock_area)
-            self.dock_area.setParent(None)
-
-        self.dock_area = DockArea()
-        self.layout.addWidget(self.dock_area)
+    def _build_grid(self, depth_indices: List[int]) -> None:
+        """(Re)build one image pane per present focal depth in a near-square grid."""
+        while self.grid_layout.count():
+            item = self.grid_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.setParent(None)
         self.depth_items.clear()
+        self.depth_plots.clear()
+        self._grid_depths = list(depth_indices)
 
-        docks: List[Dock] = []
-        for i, depth in enumerate(self.depths):
-            dock = Dock(depth, size=(450, 320), closable=True)
+        count = len(depth_indices)
+        if count == 0:
+            return
+
+        # Near-square arrangement so panes stay large regardless of depth count.
+        columns = math.ceil(math.sqrt(count))
+        for position, depth_index in enumerate(depth_indices):
+            row, col = divmod(position, columns)
+            depth_name = self.patient_ts.get_depth_name(depth_index)
+
             glw = pg.GraphicsLayoutWidget()
-            plot = glw.addPlot(title=depth)
+            glw.setBackground(C_IMG_BG)
+            plot = glw.addPlot(title=depth_name)
             plot.setAspectLocked(True)
             plot.hideAxis("left")
             plot.hideAxis("bottom")
@@ -2590,36 +2607,45 @@ class AllDepthsWindow(QMainWindow):
 
             image_item = pg.ImageItem()
             plot.addItem(image_item)
-            dock.addWidget(glw)
-
-            docks.append(dock)
-            self.depth_items[i] = image_item
-
-        # Deterministic default: row 1 has 0,1,2; row 2 has 3,4,5; row 3 has 6.
-        self.dock_area.addDock(docks[0], "left")
-        self.dock_area.addDock(docks[1], "right", docks[0])
-        self.dock_area.addDock(docks[2], "right", docks[1])
-        self.dock_area.addDock(docks[3], "bottom", docks[0])
-        self.dock_area.addDock(docks[4], "right", docks[3])
-        self.dock_area.addDock(docks[5], "right", docks[4])
-        self.dock_area.addDock(docks[6], "bottom", docks[3])
+            self.grid_layout.addWidget(glw, row, col)
+            self.depth_items[depth_index] = image_item
+            self.depth_plots[depth_index] = plot
 
     def update_images(self, patient_ts, timepoint: int) -> None:
         self.patient_ts = patient_ts
         self.timepoint = timepoint
-        for depth_index, image_item in list(self.depth_items.items()):
-            if not patient_ts.depth_has_images(depth_index):
-                continue
+
+        populated = patient_ts.populated_depth_indices()
+        if populated != self._grid_depths:
+            self._build_grid(populated)
+
+        for depth_index, image_item in self.depth_items.items():
             try:
                 image = patient_ts.get_image(timepoint, depth_index)
                 image_item.setImage(image.T)
-            except RuntimeError:
-                # The user may have closed this dock; reset restores it.
+            except (RuntimeError, IndexError):
                 continue
 
-    def reset_docks(self) -> None:
-        self._build_dock_area()
-        self.update_images(self.patient_ts, self.timepoint)
+        self._refresh_chrome()
+
+    def _refresh_chrome(self) -> None:
+        """Update the header and highlight the depth currently being labeled."""
+        parent = self.parent()
+        current_depth = getattr(parent, "current_depth", None)
+
+        for depth_index, plot in self.depth_plots.items():
+            name = self.patient_ts.get_depth_name(depth_index)
+            if depth_index == current_depth:
+                plot.setTitle(f"▸ {name}", color=C_ACCENT, bold=True)
+            else:
+                plot.setTitle(name, color=C_MUTED)
+
+        patient_id = getattr(self.patient_ts, "patient_id", "")
+        count = len(self._grid_depths)
+        suffix = "depth" if count == 1 else "depths"
+        self.header_label.setText(
+            f"{patient_id}   ·   timepoint {self.timepoint + 1}   ·   {count} {suffix}"
+        )
 
     def closeEvent(self, event) -> None:
         parent = self.parent()
@@ -3129,9 +3155,10 @@ class SegImageDraw(pg.ImageItem):
     ViewBox for panning. The eraser is just the brush with class index 0.
     """
 
-    def __init__(self, window: "SegmentationWindow"):
+    def __init__(self, window: "SegmentationWindow", view: "SegViewBox"):
         super().__init__()
         self.window = window
+        self.view = view   # the pane's own ViewBox (for pan forwarding)
         self.setOpts(axisOrder="row-major")
         self.setZValue(10)
         self._last_pos = None
@@ -3160,13 +3187,13 @@ class SegImageDraw(pg.ImageItem):
             return
         self.window.begin_stroke()
         self._stamp_at(int(ev.pos().y()), int(ev.pos().x()))
-        self.render_mask()
+        self.window.render_overlays()
         self.window.end_stroke()
 
     def mouseDragEvent(self, ev):
         if ev.button() != QtCore.Qt.LeftButton or self.window.mask is None:
-            # Right/middle drag pans; hand the event to the ViewBox.
-            self.window.view.mouseDragEvent(ev)
+            # Right/middle drag pans; hand the event to this pane's ViewBox.
+            self.view.mouseDragEvent(ev)
             return
         if self.window.select_mode or self._is_select(ev):
             # Selecting, not painting: pick the mass under the drag start, ignore the rest.
@@ -3179,14 +3206,16 @@ class SegImageDraw(pg.ImageItem):
             self.window.begin_stroke()
             self._stamp_at(int(ev.pos().y()), int(ev.pos().x()))
             self._last_pos = ev.pos()
+            self.render_mask()       # active pane updates live for a responsive brush
         elif ev.isFinish():
             self._last_pos = None
             self.window.end_stroke()
+            self.window.render_overlays()   # sync every depth pane at stroke end
         else:
             if self._last_pos is not None:
                 self._stamp_line(self._last_pos, ev.pos())
             self._last_pos = ev.pos()
-        self.render_mask()
+            self.render_mask()
 
     # --- brush stamping ---------------------------------------------------
     def _stamp_line(self, p0, p1) -> None:
@@ -3209,6 +3238,45 @@ class SegImageDraw(pg.ImageItem):
             return
         sub = kernel[mr0 - r0: mr1 - r0, mc0 - c0: mc1 - c0]
         mask[mr0:mr1, mc0:mc1][sub] = self.window.current_class_index
+
+
+class SegDepthPane:
+    """One focal-depth view in the segmentation canvas.
+
+    Bundles a painting ``SegViewBox`` with a grayscale base image, a translucent mask
+    overlay (``SegImageDraw``) and a selection-highlight item. Every pane's overlay
+    renders the window's *shared* per-timepoint mask, so painting in one pane edits the
+    same mask and all panes refresh together. This is what lets the user consult all
+    focal depths at once and segment from whichever depth shows the structure clearest
+    (the mask is depth-agnostic — see ``SegmentationWindow``).
+    """
+
+    def __init__(self, window: "SegmentationWindow", depth_index: int):
+        self.window = window
+        self.depth_index = depth_index
+        self.glw = pg.GraphicsLayoutWidget()
+        self.glw.setBackground(C_IMG_BG)
+        self.view = SegViewBox()
+        self.view.setAspectLocked(True)
+        self.view.invertY(True)
+        self.glw.addItem(self.view)
+        self.base_item = pg.ImageItem()
+        self.base_item.setOpts(axisOrder="row-major")
+        self.mask_item = SegImageDraw(window, self.view)
+        self.selection_item = pg.ImageItem()
+        self.selection_item.setOpts(axisOrder="row-major")
+        self.selection_item.setZValue(20)   # selection highlight sits above the mask
+        self.view.addItem(self.base_item)
+        self.view.addItem(self.mask_item)
+        self.view.addItem(self.selection_item)
+
+    def render_base(self) -> None:
+        patient = self.window.patient_ts
+        if patient is None or not patient.depth_has_images(self.depth_index):
+            self.base_item.clear()
+            return
+        image = patient.get_image(self.window.current_timepoint, self.depth_index)
+        self.base_item.setImage(image, autoLevels=True)
 
 
 class SegmentationWindow(QMainWindow):
@@ -3237,6 +3305,11 @@ class SegmentationWindow(QMainWindow):
         self.lut = _seg_lut(self.active_stage)
         self.mask: Optional[np.ndarray] = None
 
+        # Canvas can show a single focal depth (default) or every populated depth at
+        # once ("all depths"), painting the same shared mask from any pane.
+        self.all_depths = False
+        self.panes: List[SegDepthPane] = []
+
         self._dirty = False
         self._loading = False
         self._undo: List[np.ndarray] = []
@@ -3264,7 +3337,7 @@ class SegmentationWindow(QMainWindow):
         if patient_ts is not None and patient_ts.num_timepoints() > 0:
             self._load_mask_for_current()
             self._render_base()
-            self.view.autoRange()
+            self._auto_range_all()
         self._update_indicators()
 
     # ------------------------------------------------------------------
@@ -3291,28 +3364,21 @@ class SegmentationWindow(QMainWindow):
 
         root.addWidget(self._build_toolbar())
 
-        self.glw = pg.GraphicsLayoutWidget()
-        self.glw.setBackground(C_IMG_BG)
-        self.view = SegViewBox()
-        self.view.setAspectLocked(True)
-        self.view.invertY(True)
-        self.glw.addItem(self.view)
-        self.base_item = pg.ImageItem()
-        self.base_item.setOpts(axisOrder="row-major")
-        self.mask_item = SegImageDraw(self)
-        self.selection_item = pg.ImageItem()
-        self.selection_item.setOpts(axisOrder="row-major")
-        self.selection_item.setZValue(20)   # selection highlight sits above the mask
-        self.view.addItem(self.base_item)
-        self.view.addItem(self.mask_item)
-        self.view.addItem(self.selection_item)
-        root.addWidget(self.glw, 1)
+        # Canvas container: holds either a single focal-depth pane or, in "all depths"
+        # mode, a grid of one pane per populated depth. Rebuilt by _build_canvas();
+        # every pane shares the window's mask (see SegDepthPane).
+        self.canvas_container = QWidget()
+        self.canvas_layout = QVBoxLayout(self.canvas_container)
+        self.canvas_layout.setContentsMargins(0, 0, 0, 0)
+        self.canvas_layout.setSpacing(4)
+        root.addWidget(self.canvas_container, 1)
+        self._build_canvas()
 
         self.hint_label = QLabel(
             "left-drag paint · right-drag pan · wheel zoom    |    "
             "1/2/3 structure · 0/E erase · [ ] brush · Ctrl+Z/Ctrl+Shift+Z undo/redo · "
             "Ctrl+click (or V) select mass · ⌫ delete · Esc clear · "
-            "← → frame · ↑ ↓ depth · P/B jump to tPN/tB · S switch stage"
+            "← → frame · ↑ ↓ depth · A all depths · P/B jump to tPN/tB · S switch stage"
         )
         self.hint_label.setStyleSheet(f"color: {C_MUTED}; font-size: 10px;")
         root.addWidget(self.hint_label)
@@ -3366,20 +3432,29 @@ class SegmentationWindow(QMainWindow):
         row.addWidget(self.tp_indicator)
         row.addWidget(next_tp)
 
-        prev_d = QToolButton()
-        prev_d.setText("▾")
-        prev_d.setToolTip("Lower focal depth (↓)")
-        prev_d.clicked.connect(self.prev_depth)
+        self.depth_prev_btn = QToolButton()
+        self.depth_prev_btn.setText("▾")
+        self.depth_prev_btn.setToolTip("Lower focal depth (↓)")
+        self.depth_prev_btn.clicked.connect(self.prev_depth)
         self.depth_indicator = QLabel("—")
         self.depth_indicator.setMinimumWidth(48)
         self.depth_indicator.setAlignment(Qt.AlignCenter)
-        next_d = QToolButton()
-        next_d.setText("▴")
-        next_d.setToolTip("Higher focal depth (↑)")
-        next_d.clicked.connect(self.next_depth)
-        row.addWidget(prev_d)
+        self.depth_next_btn = QToolButton()
+        self.depth_next_btn.setText("▴")
+        self.depth_next_btn.setToolTip("Higher focal depth (↑)")
+        self.depth_next_btn.clicked.connect(self.next_depth)
+        row.addWidget(self.depth_prev_btn)
         row.addWidget(self.depth_indicator)
-        row.addWidget(next_d)
+        row.addWidget(self.depth_next_btn)
+
+        self.all_depths_btn = QToolButton()
+        self.all_depths_btn.setText("▦ all depths")
+        self.all_depths_btn.setCheckable(True)
+        self.all_depths_btn.setToolTip(
+            "Show every focal depth at once and paint the shared mask from any pane (A)"
+        )
+        self.all_depths_btn.clicked.connect(lambda checked: self.toggle_all_depths(checked))
+        row.addWidget(self.all_depths_btn)
 
         row.addStretch(1)
 
@@ -3448,6 +3523,7 @@ class SegmentationWindow(QMainWindow):
             add("Ctrl+Y", self.redo),
             add("Ctrl+S", self._flush),
             add("S", self.toggle_stage),
+            add("A", self.toggle_all_depths),
             add("V", self.toggle_select_mode),
             add("P", lambda: self.jump_to_stage("tPN")),
             add("B", lambda: self.jump_to_stage("tB")),
@@ -3455,6 +3531,131 @@ class SegmentationWindow(QMainWindow):
         ]
         for digit in range(4):
             self._shortcuts.append(add(str(digit), lambda d=digit: self.select_class(d)))
+
+    # ------------------------------------------------------------------
+    # Canvas: single focal depth (default) or all populated depths at once
+    # ------------------------------------------------------------------
+    def _build_canvas(self) -> None:
+        """(Re)build the canvas for the current mode and patient.
+
+        Single mode shows one pane for ``current_depth``; all-depths mode tiles one
+        pane per populated focal depth in a near-square grid (mirroring the dynamic
+        ``AllDepthsWindow`` grid). Every pane paints the same shared per-timepoint mask.
+        """
+        self._teardown_canvas()
+        depths = (
+            self.patient_ts.populated_depth_indices()
+            if (self.all_depths and self.patient_ts is not None) else []
+        )
+        if len(depths) > 1:
+            self._build_all_depths_canvas(depths)
+        else:
+            # Single depth, or all-depths requested but only one depth is populated.
+            self._build_single_canvas()
+
+    def _teardown_canvas(self) -> None:
+        # Dropping the top-level widgets cascades to the views/items they own.
+        self.panes = []
+        while self.canvas_layout.count():
+            item = self.canvas_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.setParent(None)
+                widget.deleteLater()
+
+    def _build_single_canvas(self) -> None:
+        depth = self.current_depth
+        patient = self.patient_ts
+        if patient is not None and not patient.depth_has_images(depth):
+            populated = patient.populated_depth_indices()
+            if populated:
+                depth = populated[0]
+                self.current_depth = depth
+        pane = SegDepthPane(self, depth)
+        self.panes = [pane]
+        self.canvas_layout.addWidget(pane.glw)
+
+    def _build_all_depths_canvas(self, depths: List[int]) -> None:
+        container = QWidget()
+        grid = QGridLayout(container)
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setSpacing(6)
+
+        # Near-square arrangement so panes stay large regardless of depth count
+        # (same heuristic as AllDepthsWindow).
+        columns = math.ceil(math.sqrt(len(depths)))
+        for position, depth_index in enumerate(depths):
+            row, col = divmod(position, columns)
+            pane = SegDepthPane(self, depth_index)
+            self.panes.append(pane)
+            grid.addWidget(pane.glw, row, col)
+
+        self.canvas_layout.addWidget(container)
+
+    def _refresh_canvas(self) -> None:
+        """Repaint base images, overlay and selection across all panes, then fit each."""
+        if self.patient_ts is None or self.patient_ts.num_timepoints() == 0:
+            return
+        self._render_base()
+        self.render_overlays()
+        self.render_selections()
+        self._auto_range_all()
+
+    def _auto_range_all(self) -> None:
+        for pane in self.panes:
+            try:
+                pane.view.autoRange()
+            except RuntimeError:
+                continue
+
+    def render_overlays(self) -> None:
+        """Re-render the mask overlay on every focal-depth pane (shared mask)."""
+        for pane in self.panes:
+            try:
+                pane.mask_item.render_mask()
+            except RuntimeError:
+                continue
+
+    def render_selections(self) -> None:
+        """Re-render the mass-selection highlight on every pane."""
+        highlight = None
+        if self._selection is not None and self._selection.any():
+            highlight = np.zeros((*self._selection.shape, 4), dtype=np.uint8)
+            highlight[self._selection] = SEG_SELECT_RGBA
+        for pane in self.panes:
+            try:
+                if highlight is None:
+                    pane.selection_item.clear()
+                else:
+                    pane.selection_item.setImage(highlight, autoLevels=False)
+            except RuntimeError:
+                continue
+
+    def _clear_overlays(self) -> None:
+        for pane in self.panes:
+            try:
+                pane.mask_item.clear()
+                pane.selection_item.clear()
+            except RuntimeError:
+                continue
+
+    def toggle_all_depths(self, on: Optional[bool] = None) -> None:
+        target = (not self.all_depths) if on is None else bool(on)
+        self.all_depths = target
+        if self.all_depths_btn.isChecked() != target:
+            self.all_depths_btn.blockSignals(True)
+            self.all_depths_btn.setChecked(target)
+            self.all_depths_btn.blockSignals(False)
+        self._build_canvas()
+        self._refresh_canvas()
+        self._sync_depth_controls()
+        self._update_indicators()
+
+    def _sync_depth_controls(self) -> None:
+        # ↑↓ only navigates in single-depth mode; all depths are shown together.
+        enabled = not self.all_depths
+        self.depth_prev_btn.setEnabled(enabled)
+        self.depth_next_btn.setEnabled(enabled)
 
     # ------------------------------------------------------------------
     # Stage / structure / brush selection
@@ -3551,12 +3752,11 @@ class SegmentationWindow(QMainWindow):
     # Image + mask display
     # ------------------------------------------------------------------
     def _render_base(self) -> None:
-        patient = self.patient_ts
-        if patient is None or not patient.depth_has_images(self.current_depth):
-            self.base_item.clear()
-            return
-        image = patient.get_image(self.current_timepoint, self.current_depth)
-        self.base_item.setImage(image, autoLevels=True)
+        for pane in self.panes:
+            try:
+                pane.render_base()
+            except RuntimeError:
+                continue
 
     def _load_mask_for_current(self) -> None:
         self._loading = True
@@ -3569,8 +3769,7 @@ class SegmentationWindow(QMainWindow):
             ):
                 self.mask = None
                 self._selection = None
-                self.mask_item.clear()
-                self.selection_item.clear()
+                self._clear_overlays()
                 return
             image = patient.get_image(self.current_timepoint, self.current_depth)
             height, width = image.shape[:2]
@@ -3591,8 +3790,8 @@ class SegmentationWindow(QMainWindow):
             self._redo.clear()
             self._selection = None
             self._dirty = False
-            self.mask_item.render_mask()
-            self.selection_item.clear()
+            self.render_overlays()
+            self.render_selections()
         finally:
             self._loading = False
         self._update_save_indicator()
@@ -3627,12 +3826,14 @@ class SegmentationWindow(QMainWindow):
 
     def _goto_depth(self, step: int) -> None:
         patient = self.patient_ts
-        if patient is None:
-            return
+        if patient is None or self.all_depths:
+            return   # all depths already shown; ↑↓ only navigates in single-depth mode
         index = self.current_depth + step
         while 0 <= index < patient.num_depths():
             if patient.depth_has_images(index):
                 self.current_depth = index
+                if self.panes:
+                    self.panes[0].depth_index = index
                 # Mask is per-timepoint (depth-agnostic): only the background changes.
                 self._render_base()
                 self._update_indicators()
@@ -3697,7 +3898,7 @@ class SegmentationWindow(QMainWindow):
         self._redo.append(self.mask.copy())
         self.mask = self._undo.pop()
         self.clear_selection()
-        self.mask_item.render_mask()
+        self.render_overlays()
         self._mark_dirty()
 
     def redo(self) -> None:
@@ -3706,7 +3907,7 @@ class SegmentationWindow(QMainWindow):
         self._undo.append(self.mask.copy())
         self.mask = self._redo.pop()
         self.clear_selection()
-        self.mask_item.render_mask()
+        self.render_overlays()
         self._mark_dirty()
 
     def clear_mask(self) -> None:
@@ -3714,7 +3915,7 @@ class SegmentationWindow(QMainWindow):
             return
         self.begin_stroke()
         self.mask[:] = 0
-        self.mask_item.render_mask()
+        self.render_overlays()
         self._mark_dirty()
 
     # ------------------------------------------------------------------
@@ -3761,7 +3962,7 @@ class SegmentationWindow(QMainWindow):
             self._selection |= component
         if not self._selection.any():
             self._selection = None
-        self._render_selection()
+        self.render_selections()
         self._update_indicators()
         count = self._selection_count()
         self.statusBar().showMessage(
@@ -3776,18 +3977,10 @@ class SegmentationWindow(QMainWindow):
         _labeled, n = ndimage.label(self._selection, structure=SEG_SELECT_CONNECTIVITY)
         return int(n)
 
-    def _render_selection(self) -> None:
-        if self._selection is None or not self._selection.any():
-            self.selection_item.clear()
-            return
-        highlight = np.zeros((*self._selection.shape, 4), dtype=np.uint8)
-        highlight[self._selection] = SEG_SELECT_RGBA
-        self.selection_item.setImage(highlight, autoLevels=False)
-
     def clear_selection(self) -> None:
         if self._selection is not None:
             self._selection = None
-            self._render_selection()
+            self.render_selections()
             self._update_indicators()
 
     def delete_selection(self) -> None:
@@ -3797,8 +3990,8 @@ class SegmentationWindow(QMainWindow):
         self._push_undo()                # undoable; keeps the selection until after delete
         self.mask[self._selection] = 0
         self._selection = None
-        self.mask_item.render_mask()
-        self._render_selection()
+        self.render_overlays()
+        self.render_selections()
         self._mark_dirty()
         self._update_indicators()
         self.statusBar().showMessage(f"Deleted {count} mass(es)", 3000)
@@ -3859,7 +4052,9 @@ class SegmentationWindow(QMainWindow):
         self.tp_indicator.setText(
             f"{self.active_stage} · t {self.current_timepoint}/{patient.num_timepoints() - 1}{flag}"
         )
-        self.depth_indicator.setText(patient.get_depth_name(self.current_depth))
+        self.depth_indicator.setText(
+            "all" if self.all_depths else patient.get_depth_name(self.current_depth)
+        )
         self._update_save_indicator()
 
     def _update_save_indicator(self) -> None:
@@ -3887,15 +4082,14 @@ class SegmentationWindow(QMainWindow):
         self._redo.clear()
         self._selection = None
         self._dirty = False
+        self._build_canvas()   # populated focal depths can differ between patients
         if patient_ts is not None and patient_ts.num_timepoints() > 0:
             self._load_mask_for_current()
             self._render_base()
-            self.view.autoRange()
+            self._auto_range_all()
         else:
             self.mask = None
-            self.base_item.clear()
-            self.mask_item.clear()
-            self.selection_item.clear()
+            self._clear_overlays()
         self._update_indicators()
 
     def closeEvent(self, event) -> None:

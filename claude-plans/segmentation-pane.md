@@ -154,7 +154,14 @@ The delegated decisions, as built (see `data.py` / `gui.py` docstrings for detai
    pronucleus]`, `tB = [bg, TE, ICM, ZP]`. Colors/hotkeys live in `gui.py` (UI). One
    class per pixel.
 5. **Focal depth.** Mask is per-timepoint (depth-agnostic). F0 default; ↑↓ scrolls depths
-   and only swaps the background image, leaving the overlay intact.
+   and only swaps the background image, leaving the overlay intact. An **"all depths"
+   toggle** (`▦ all depths` / `A`) swaps the single canvas for a near-square grid of one
+   pane per populated depth (same heuristic as the dynamic `AllDepthsWindow` grid); every
+   pane renders the same shared mask, so the user can consult all depths at once and paint
+   from whichever shows the structure clearest. Each pane is a `SegDepthPane` (own
+   `SegViewBox` + base + overlay + selection); the active pane repaints live during a
+   stroke and all panes sync at stroke end (and on undo/redo/clear/load). ↑↓ is inert
+   while all-depths is on.
 6. **Navigation.** `⤓ tPN` / `⤓ tB` (and `P` / `B`) jump to the first postprocessed-
    prediction frame of that stage; missing predictions or no such stage surface a dialog.
    Arrow keys remain a manual fallback.
