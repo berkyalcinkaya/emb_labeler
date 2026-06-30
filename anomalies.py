@@ -74,6 +74,31 @@ def _median(values: List[float]) -> float:
     return 0.5 * (ordered[mid - 1] + ordered[mid])
 
 
+def filter_anomalies(data: Dict[str, Any], suppressed_types) -> Dict[str, Any]:
+    """Return a copy of ``compute_anomalies`` output with the given signal types removed.
+
+    Used by the GUI so anomaly types the user has chosen not to surface (e.g.
+    ``decode_changed`` / ``low_confidence``) are hidden from the timeline, the HUD, and
+    Next/Previous-anomaly navigation without recomputing the underlying scores.
+    """
+    suppressed = set(suppressed_types or ())
+    if not suppressed:
+        return data
+    per_timepoint: List[Dict[str, Any]] = []
+    flagged: List[int] = []
+    signal_counts: Dict[str, int] = {}
+    for entry in data["per_timepoint"]:
+        signals = [s for s in entry["signals"] if s["type"] not in suppressed]
+        if signals:
+            flagged.append(entry["timepoint"])
+            for signal in signals:
+                signal_counts[signal["type"]] = signal_counts.get(signal["type"], 0) + 1
+        per_timepoint.append(
+            {"timepoint": entry["timepoint"], "signals": signals, "score": len(signals)}
+        )
+    return {**data, "per_timepoint": per_timepoint, "flagged": flagged, "signal_counts": signal_counts}
+
+
 def compute_anomalies(
     patient_ts,
     low_prob_threshold: float = LOW_PROB_THRESHOLD,

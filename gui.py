@@ -571,8 +571,10 @@ class EmbryoLabelingApp(QMainWindow):
         self._pred_arrays: Optional[Dict] = None
         self._ocr_arrays: Optional[Dict] = None
         self._anomaly_cache: Optional[Dict] = None
-        self._stage_start: Optional[int] = None
-        self._stage_end: Optional[int] = None
+        # Anomaly types the user has opted to surface (off by default — these two are
+        # noisy and rarely actionable). Driven by the checkboxes beneath the timeline.
+        self._show_decode_changed = False
+        self._show_low_confidence = False
 
         # Per-embryo navigation state (timepoint + focal depth), keyed by patient
         # directory, so toggling between loaded embryos returns each to where it was
@@ -779,7 +781,45 @@ class EmbryoLabelingApp(QMainWindow):
         self.timeline_strip.setMinimumHeight(118)
         self.timeline_strip.setMaximumHeight(150)
         layout.addWidget(self.timeline_strip)
+
+        # Small anomaly-visibility toggles in the bottom-left corner. Both off by default;
+        # when checked the corresponding signal type is surfaced on the timeline, in the
+        # HUD, and in Next/Previous-anomaly navigation.
+        filters = QHBoxLayout()
+        filters.setContentsMargins(2, 0, 0, 0)
+        filters.setSpacing(12)
+        self.filter_decode_checkbox = QCheckBox("argmax≠decoded")
+        self.filter_decode_checkbox.setToolTip(
+            "Surface timepoints where the raw argmax differs from the monotonic-decoded class"
+        )
+        self.filter_decode_checkbox.toggled.connect(self._on_anomaly_filter_toggled)
+        self.filter_lowconf_checkbox = QCheckBox("low confidence")
+        self.filter_lowconf_checkbox.setToolTip(
+            "Surface timepoints where the prediction's max probability is low"
+        )
+        self.filter_lowconf_checkbox.toggled.connect(self._on_anomaly_filter_toggled)
+        for box in (self.filter_decode_checkbox, self.filter_lowconf_checkbox):
+            box.setStyleSheet(f"color: {C_MUTED}; font-size: 10px;")
+            filters.addWidget(box)
+        filters.addStretch(1)
+        layout.addLayout(filters)
         return bar
+
+    def _on_anomaly_filter_toggled(self, _checked: bool) -> None:
+        self._show_decode_changed = self.filter_decode_checkbox.isChecked()
+        self._show_low_confidence = self.filter_lowconf_checkbox.isChecked()
+        self.update_prediction_label()
+        for widget in self._timeline_widgets():
+            widget.refresh()
+
+    def _suppressed_signal_types(self) -> set:
+        """Anomaly signal types to hide given the current filter checkbox state."""
+        suppressed = set()
+        if not self._show_decode_changed:
+            suppressed.add(anomalies.SIGNAL_DECODE_CHANGED)
+        if not self._show_low_confidence:
+            suppressed.add(anomalies.SIGNAL_LOW_CONFIDENCE)
+        return suppressed
 
     def _build_rail(self) -> QWidget:
         rail = QFrame()
@@ -846,8 +886,9 @@ class EmbryoLabelingApp(QMainWindow):
         layout.addSpacing(6)
         hint = QLabel(
             "← → timepoint   ↑ ↓ depth\n"
-            "A accept pred\n"
-            "[ ] mark stage · F fill\n"
+            "⌘← ⌘→ stage boundary\n"
+            "A accept pred · F accept all\n"
+            "⌘F fill between labels\n"
             "N / P next/prev anomaly"
         )
         hint.setStyleSheet(f"color: {C_MUTED}; font-size: 10px;")
@@ -877,13 +918,17 @@ class EmbryoLabelingApp(QMainWindow):
             shortcut.activated.connect(lambda c=cls: self.select_label_by_class(c))
             self._label_shortcuts.append(shortcut)
 
-        # Assisted-labeling shortcuts (keyboard-first stage auto-fill + anomaly review).
-        self.shortcut_stage_start = QShortcut(QtCore.Qt.Key_BracketLeft, self)
-        self.shortcut_stage_start.activated.connect(self.mark_stage_start)
-        self.shortcut_stage_end = QShortcut(QtCore.Qt.Key_BracketRight, self)
-        self.shortcut_stage_end.activated.connect(self.mark_stage_end)
-        self.shortcut_fill_stage = QShortcut(QtCore.Qt.Key_F, self)
-        self.shortcut_fill_stage.activated.connect(self.fill_stage_with_selected)
+        # Jump between predicted stage boundaries (Cmd/Ctrl + arrows).
+        self.shortcut_next_boundary = QShortcut(QKeySequence("Ctrl+Right"), self)
+        self.shortcut_next_boundary.activated.connect(self.goto_next_boundary)
+        self.shortcut_prev_boundary = QShortcut(QKeySequence("Ctrl+Left"), self)
+        self.shortcut_prev_boundary.activated.connect(self.goto_prev_boundary)
+
+        # Assisted-labeling shortcuts (keyboard-first prediction accept + auto-fill).
+        self.shortcut_accept_predicted = QShortcut(QtCore.Qt.Key_F, self)
+        self.shortcut_accept_predicted.activated.connect(self.accept_predicted_unlabeled)
+        self.shortcut_fill_between = QShortcut(QKeySequence("Ctrl+F"), self)
+        self.shortcut_fill_between.activated.connect(self.fill_between_labels)
         self.shortcut_accept_pred = QShortcut(QtCore.Qt.Key_A, self)
         self.shortcut_accept_pred.activated.connect(self.accept_prediction_current)
         self.shortcut_next_anomaly = QShortcut(QtCore.Qt.Key_N, self)
@@ -947,18 +992,19 @@ class EmbryoLabelingApp(QMainWindow):
         toggle_seq_action.triggered.connect(self.toggle_prediction_sequence)
         assist_menu.addAction(toggle_seq_action)
         assist_menu.addSeparator()
-        mark_start_action = QAction("Mark stage start  [", self)
-        mark_start_action.triggered.connect(self.mark_stage_start)
-        assist_menu.addAction(mark_start_action)
-        mark_end_action = QAction("Mark stage end  ]", self)
-        mark_end_action.triggered.connect(self.mark_stage_end)
-        assist_menu.addAction(mark_end_action)
-        fill_action = QAction("Fill stage with selected class  (F)", self)
-        fill_action.triggered.connect(self.fill_stage_with_selected)
-        assist_menu.addAction(fill_action)
-        accept_stage_action = QAction("Accept predictions for stage", self)
-        accept_stage_action.triggered.connect(self.accept_predictions_for_stage)
-        assist_menu.addAction(accept_stage_action)
+        prev_boundary_action = QAction("Previous stage boundary  (Cmd+←)", self)
+        prev_boundary_action.triggered.connect(self.goto_prev_boundary)
+        assist_menu.addAction(prev_boundary_action)
+        next_boundary_action = QAction("Next stage boundary  (Cmd+→)", self)
+        next_boundary_action.triggered.connect(self.goto_next_boundary)
+        assist_menu.addAction(next_boundary_action)
+        assist_menu.addSeparator()
+        accept_predicted_action = QAction("Accept predicted (all unlabeled)  (F)", self)
+        accept_predicted_action.triggered.connect(self.accept_predicted_unlabeled)
+        assist_menu.addAction(accept_predicted_action)
+        fill_between_action = QAction("Auto-fill between labels  (Cmd+F)", self)
+        fill_between_action.triggered.connect(self.fill_between_labels)
+        assist_menu.addAction(fill_between_action)
         accept_current_action = QAction("Accept prediction (current)  (A)", self)
         accept_current_action.triggered.connect(self.accept_prediction_current)
         assist_menu.addAction(accept_current_action)
@@ -1112,8 +1158,6 @@ class EmbryoLabelingApp(QMainWindow):
         self._pred_arrays = None
         self._ocr_arrays = None
         self._anomaly_cache = None
-        self._stage_start = None
-        self._stage_end = None
         self._pending_roi = None
 
         # Bind the timeline to the new patient first (it resets to t0), then display the
@@ -1411,6 +1455,8 @@ class EmbryoLabelingApp(QMainWindow):
         self.label_buttons.setExclusive(True)
         self.current_patient_ts.set_label(self.current_timepoint, cls)
         self._after_label_change()
+        # Auto-advance to the next timepoint so labeling is a single keystroke per frame.
+        self.show_next_timepoint()
 
     # ------------------------------------------------------------------
     # Optional panels/windows
@@ -2322,7 +2368,9 @@ class EmbryoLabelingApp(QMainWindow):
     def _get_anomalies(self) -> Optional[Dict]:
         if self._anomaly_cache is None and self.current_patient_ts is not None:
             self._anomaly_cache = anomalies.compute_anomalies(self.current_patient_ts)
-        return self._anomaly_cache
+        if self._anomaly_cache is None:
+            return None
+        return anomalies.filter_anomalies(self._anomaly_cache, self._suppressed_signal_types())
 
     def _timeline_widgets(self) -> List:
         """The embedded strip plus the standalone window when it is open."""
@@ -2379,9 +2427,6 @@ class EmbryoLabelingApp(QMainWindow):
         else:
             parts.append(self._chip("unlabeled", C_MUTED))
 
-        if self._stage_start is not None or self._stage_end is not None:
-            parts.append(self._chip(f"stage [{self._stage_start}, {self._stage_end}]", C_PRED))
-
         anomaly_data = self._get_anomalies()
         if anomaly_data and timepoint < len(anomaly_data["per_timepoint"]):
             signals = anomaly_data["per_timepoint"][timepoint]["signals"]
@@ -2402,7 +2447,7 @@ class EmbryoLabelingApp(QMainWindow):
             widget.set_show_postprocessed(self.show_postprocessed)
 
     # ==================================================================
-    # Navigation + stage auto-fill (Phase 6)
+    # Navigation + prediction-driven auto-fill
     # ==================================================================
     def jump_to_timepoint(self, timepoint: int) -> None:
         if self.current_patient_ts is None:
@@ -2411,73 +2456,92 @@ class EmbryoLabelingApp(QMainWindow):
         self.current_timepoint = timepoint
         self.display_image()
 
-    def mark_stage_start(self) -> None:
+    def _predicted_boundaries(self) -> List[int]:
+        """Timepoints where the predicted stage changes (incl. the first known one)."""
+        pred = self._get_pred_arrays()
+        if not pred:
+            return []
+        return anomalies.stage_boundaries(pred["post_class_index"])
+
+    def goto_next_boundary(self) -> None:
+        self._goto_boundary(forward=True)
+
+    def goto_prev_boundary(self) -> None:
+        self._goto_boundary(forward=False)
+
+    def _goto_boundary(self, forward: bool) -> None:
         if self.current_patient_ts is None:
             return
-        self._stage_start = self.current_timepoint
-        self.statusBar().showMessage(f"Stage start marked at t={self._stage_start}", 3000)
-        self.update_prediction_label()
-        for widget in self._timeline_widgets():
-            widget.set_stage_markers()
-
-    def mark_stage_end(self) -> None:
-        if self.current_patient_ts is None:
+        boundaries = self._predicted_boundaries()
+        if not boundaries:
+            self.statusBar().showMessage("No predicted boundaries (run predictions)", 3000)
             return
-        self._stage_end = self.current_timepoint
-        self.statusBar().showMessage(f"Stage end marked at t={self._stage_end}", 3000)
-        self.update_prediction_label()
-        for widget in self._timeline_widgets():
-            widget.set_stage_markers()
+        current = self.current_timepoint
+        if forward:
+            candidates = [t for t in boundaries if t > current]
+            target = candidates[0] if candidates else None
+        else:
+            candidates = [t for t in boundaries if t < current]
+            target = candidates[-1] if candidates else None
+        if target is None:
+            self.statusBar().showMessage("No further predicted boundary", 2000)
+            return
+        self.jump_to_timepoint(target)
+        self.statusBar().showMessage(f"Stage boundary at t={target}", 2000)
 
-    def _stage_range(self) -> Optional[tuple]:
-        if self._stage_start is None or self._stage_end is None:
-            QMessageBox.information(
-                self,
-                "Mark the stage first",
-                "Mark a stage start with '[' and end with ']' (on the timepoint you want), "
-                "then fill.",
-            )
-            return None
-        lo, hi = sorted((self._stage_start, self._stage_end))
-        return lo, hi
-
-    def fill_stage_with_selected(self) -> None:
+    def accept_predicted_unlabeled(self) -> None:
+        """Fill every currently-unlabeled timepoint with its predicted label (F)."""
         patient = self.current_patient_ts
         if patient is None:
-            return
-        stage_range = self._stage_range()
-        if stage_range is None:
-            return
-        label = self._selected_label()
-        if label is None:
-            QMessageBox.information(self, "Select a class", "Select a timepoint class first.")
-            return
-        lo, hi = stage_range
-        for timepoint in range(lo, hi + 1):
-            patient.set_label(timepoint, label)
-        self.statusBar().showMessage(f"Filled t={lo}..{hi} with {label}", 4000)
-        self._after_label_change()
-
-    def accept_predictions_for_stage(self) -> None:
-        patient = self.current_patient_ts
-        if patient is None:
-            return
-        stage_range = self._stage_range()
-        if stage_range is None:
             return
         pred = self._get_pred_arrays()
         if not pred:
             QMessageBox.information(self, "No predictions", "Run predictions first.")
             return
-        lo, hi = stage_range
+        key = "post_class" if self.show_postprocessed else "raw_class"
         applied = 0
-        for timepoint in range(lo, hi + 1):
-            if timepoint < pred["num_timepoints"]:
-                predicted = pred["post_class"][timepoint]
-                if predicted:
-                    patient.set_label(timepoint, predicted)
-                    applied += 1
-        self.statusBar().showMessage(f"Accepted predictions for {applied} timepoint(s)", 4000)
+        for timepoint in range(pred["num_timepoints"]):
+            if patient.get_label(timepoint) is not None:
+                continue
+            predicted = pred[key][timepoint]
+            if predicted:
+                patient.set_label(timepoint, predicted)
+                applied += 1
+        self.statusBar().showMessage(
+            f"Accepted predictions for {applied} unlabeled timepoint(s)", 4000
+        )
+        self._after_label_change()
+
+    def fill_between_labels(self) -> None:
+        """Fill from the current timepoint back to the previous labeled timepoint with the
+        current label, provided both share that label (Cmd+F). No-op if the current
+        timepoint is unlabeled or the previous labeled timepoint has a different label.
+        With no previous labeled timepoint, fills back to t=0."""
+        patient = self.current_patient_ts
+        if patient is None:
+            return
+        current = self.current_timepoint
+        label = patient.get_label(current)
+        if label is None:
+            self.statusBar().showMessage("Label the current timepoint first", 3000)
+            return
+        prev = next(
+            (t for t in range(current - 1, -1, -1) if patient.get_label(t) is not None),
+            None,
+        )
+        if prev is None:
+            start = 0
+        elif patient.get_label(prev) != label:
+            self.statusBar().showMessage(
+                f"Previous label ({patient.get_label(prev)}) differs from {label} — not filled",
+                4000,
+            )
+            return
+        else:
+            start = prev
+        for timepoint in range(start, current + 1):
+            patient.set_label(timepoint, label)
+        self.statusBar().showMessage(f"Filled t={start}..{current} with {label}", 4000)
         self._after_label_change()
 
     def accept_prediction_current(self) -> None:
@@ -2899,8 +2963,10 @@ def draw_stage_timeline(
             linewidths=1.2, label="saved", zorder=5,
         )
 
-    # Anomalies + stage boundaries.
-    anomaly_data = anomalies.compute_anomalies(patient)
+    # Anomalies + stage boundaries (respecting the user's anomaly-visibility filters).
+    anomaly_data = anomalies.filter_anomalies(
+        anomalies.compute_anomalies(patient), app._suppressed_signal_types()
+    )
     for boundary in anomaly_data["boundaries"]:
         if 0 <= boundary < len(x):
             axis.axvline(x[boundary], color=C_BORDER, linestyle=":", linewidth=0.7, zorder=0)
@@ -2911,11 +2977,6 @@ def draw_stage_timeline(
             [x[t] for t in flagged], [top] * len(flagged),
             marker="v", color=C_ANOM, s=26, label="anomaly", zorder=6,
         )
-
-    # Stage auto-fill markers from the main window.
-    for marker, color in ((app._stage_start, C_PRED), (app._stage_end, C_ACCENT)):
-        if marker is not None and 0 <= marker < len(x):
-            axis.axvline(x[marker], color=color, linestyle="--", linewidth=1.2, zorder=1)
 
     # Current-timepoint marker (moved cheaply on navigation).
     current_x = x[current_timepoint] if 0 <= current_timepoint < len(x) else (x[0] if x else 0)
@@ -2979,9 +3040,6 @@ class TimelineView(QWidget):
 
     def set_use_ocr_axis(self, value: bool) -> None:
         self.use_ocr_axis = value
-        self.refresh()
-
-    def set_stage_markers(self) -> None:
         self.refresh()
 
     def set_current_timepoint(self, timepoint: int) -> None:
@@ -3054,9 +3112,6 @@ class TimelineWindow(QMainWindow):
         self.postprocess_checkbox.setChecked(value)
         self.postprocess_checkbox.blockSignals(False)
         self.view.set_show_postprocessed(value)
-
-    def set_stage_markers(self) -> None:
-        self.view.set_stage_markers()
 
     def refresh(self) -> None:
         self.view.refresh()
