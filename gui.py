@@ -3118,12 +3118,27 @@ def _seg_lut(stage: str) -> np.ndarray:
     return lut
 
 
+def _seg_is_pan_drag(ev) -> bool:
+    """True when a drag should pan ("move the image") instead of painting.
+
+    Panning is on right/middle-drag, or on a Cmd/Ctrl-modified left-drag — so the user
+    can reposition the canvas without drawing on it. On macOS ``Qt.ControlModifier`` is
+    the Command key, matching the Cmd+click mass-selection gesture.
+    """
+    if ev.button() in (QtCore.Qt.RightButton, QtCore.Qt.MiddleButton):
+        return True
+    return bool(
+        ev.button() == QtCore.Qt.LeftButton
+        and ev.modifiers() & QtCore.Qt.ControlModifier
+    )
+
+
 class SegViewBox(pg.ViewBox):
     """ViewBox for the segmentation canvas.
 
-    Left-drag is reserved for the mask item (painting), so panning is on right-drag and
-    zooming on the wheel — the same button-repurposing idea as yeastvision's
-    ``ViewBoxNoRightDrag``, swapped so the primary button paints.
+    Left-drag is reserved for the mask item (painting), so panning is on right-drag (or
+    Cmd/Ctrl+left-drag) and zooming on the wheel — the same button-repurposing idea as
+    yeastvision's ``ViewBoxNoRightDrag``, swapped so the primary button paints.
     """
 
     def __init__(self, **kwargs):
@@ -3132,7 +3147,7 @@ class SegViewBox(pg.ViewBox):
         self.setMouseMode(pg.ViewBox.PanMode)
 
     def mouseDragEvent(self, ev, axis=None):
-        if ev.button() in (QtCore.Qt.RightButton, QtCore.Qt.MiddleButton):
+        if _seg_is_pan_drag(ev):
             ev.accept()
             # Pan using scene coordinates so the math is correct whether the event was
             # delivered to the ViewBox directly or forwarded from the mask item (whose
@@ -3141,7 +3156,7 @@ class SegViewBox(pg.ViewBox):
             previous = self.mapSceneToView(ev.lastScenePos())
             self.translateBy(x=-(current.x() - previous.x()), y=-(current.y() - previous.y()))
         else:
-            # Left/other drags belong to the mask item; don't pan or rubber-band.
+            # Unmodified left/other drags belong to the mask item; don't pan or rubber-band.
             ev.ignore()
 
 
@@ -3191,11 +3206,15 @@ class SegImageDraw(pg.ImageItem):
         self.window.end_stroke()
 
     def mouseDragEvent(self, ev):
-        if ev.button() != QtCore.Qt.LeftButton or self.window.mask is None:
-            # Right/middle drag pans; hand the event to this pane's ViewBox.
+        if self.window.mask is None or _seg_is_pan_drag(ev):
+            # Right/middle drag and Cmd/Ctrl+left-drag pan ("move the image"); hand the
+            # event to this pane's ViewBox so the canvas moves instead of drawing.
             self.view.mouseDragEvent(ev)
             return
-        if self.window.select_mode or self._is_select(ev):
+        if ev.button() != QtCore.Qt.LeftButton:
+            ev.ignore()
+            return
+        if self.window.select_mode:
             # Selecting, not painting: pick the mass under the drag start, ignore the rest.
             ev.accept()
             if ev.isStart():
@@ -3256,6 +3275,11 @@ class SegDepthPane:
         self.depth_index = depth_index
         self.glw = pg.GraphicsLayoutWidget()
         self.glw.setBackground(C_IMG_BG)
+        # The view takes keyboard focus on click; filter its key events through the
+        # window so Backspace/Delete/Esc reach the mass-selection handler (see
+        # SegmentationWindow.eventFilter).
+        self.glw.installEventFilter(window)
+        self.glw.viewport().installEventFilter(window)
         self.view = SegViewBox()
         self.view.setAspectLocked(True)
         self.view.invertY(True)
@@ -3375,7 +3399,7 @@ class SegmentationWindow(QMainWindow):
         self._build_canvas()
 
         self.hint_label = QLabel(
-            "left-drag paint · right-drag pan · wheel zoom    |    "
+            "left-drag paint · right/Ctrl-drag pan · wheel zoom    |    "
             "1/2/3 structure · 0/E erase · [ ] brush · Ctrl+Z/Ctrl+Shift+Z undo/redo · "
             "Ctrl+click (or V) select mass · ⌫ delete · Esc clear · "
             "← → frame · ↑ ↓ depth · A all depths · P/B jump to tPN/tB · S switch stage"
@@ -3996,19 +4020,37 @@ class SegmentationWindow(QMainWindow):
         self._update_indicators()
         self.statusBar().showMessage(f"Deleted {count} mass(es)", 3000)
 
-    def keyPressEvent(self, event) -> None:
-        # Backspace/Delete remove the selected masses; Esc clears the selection. Handled
-        # here (not as QShortcuts) so Backspace still edits the brush spin box when focused.
+    def _handle_selection_key(self, event) -> bool:
+        """Backspace/Delete delete the selected masses; Esc clears them.
+
+        Returns True if the key was consumed. Shared by :meth:`keyPressEvent` and
+        :meth:`eventFilter` so the gesture works whether focus is on the window or on a
+        pane's pyqtgraph view (which otherwise swallows the key after a click-to-select).
+        """
         if event.key() in (Qt.Key_Backspace, Qt.Key_Delete):
             if self._selection is not None and self._selection.any():
                 self.delete_selection()
-                event.accept()
-                return
+                return True
         elif event.key() == Qt.Key_Escape and self._selection is not None:
             self.clear_selection()
+            return True
+        return False
+
+    def keyPressEvent(self, event) -> None:
+        # Handled here (not as QShortcuts) so Backspace still edits the brush spin box
+        # when that has focus.
+        if self._handle_selection_key(event):
             event.accept()
             return
         super().keyPressEvent(event)
+
+    def eventFilter(self, obj, event) -> bool:
+        # Pane views (pyqtgraph QGraphicsView) take keyboard focus on click and would
+        # otherwise consume Backspace/Delete/Esc before they reach keyPressEvent. Route
+        # those through the shared handler so deleting a Cmd-selected mass works.
+        if event.type() == QtCore.QEvent.KeyPress and self._handle_selection_key(event):
+            return True
+        return super().eventFilter(obj, event)
 
     # ------------------------------------------------------------------
     # Persistence (debounced autosave + synchronous flush)
