@@ -19,6 +19,8 @@ env/
 
 # Claude Code local settings
 .claude/settings.local.json
+# Git worktrees created under .claude/ (their internal gitlinks must not be tracked)
+.claude/worktrees/
 
 # Local sample/test datasets (kept out of source per project conventions)
 test_data/
