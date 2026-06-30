@@ -64,7 +64,7 @@ def _classify_aws_error(stderr: str) -> Optional[Exception]:
             "for s3:GetObject permission on that bucket."
         )
     if "expired" in lowered and "token" in lowered:
-        return AwsAuthError("AWS credentials/token expired. Re-authenticate (e.g. `aws sso login`).")
+        return AwsAuthError("AWS credentials/token expired. Re-authenticate (e.g. `aws login`).")
     return None
 
 
@@ -84,7 +84,7 @@ def auth_status() -> "tuple[bool, str]":
     if arn:
         return True, f"Signed in to AWS as {arn}"
     return False, (
-        "Not signed in to AWS. Run `aws configure` (or `aws sso login`) with access to "
+        "Not signed in to AWS. Run `aws configure` (or `aws login`) with access to "
         "the cfai-model-weights bucket to list/download models."
     )
 

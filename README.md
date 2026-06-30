@@ -200,6 +200,10 @@ Re-run Predictions**, **Detect ROIs**), which act on the embryo currently on scr
 
   ![Setup Models dialog](docs/images/setup-models.png)
 
+  Downloaded weights are saved to a labeler-owned cache, **not** inside the
+  `embpred_deploy` package — `$EMB_LABELER_MODELS_DIR` if set, else
+  `~/.cache/emb_labeler/models/`. This survives `embpred_deploy` reinstalls/upgrades.
+
 - **Run OCR Times** — OCRs the embedded clock (bottom-right of each frame, reference
   depth F0 with retries) and writes per-timepoint hours; failures are interpolated.
 - **Run / Re-run Predictions** — runs inference on the 3-depth subset (`F-15, F0, F15`),
