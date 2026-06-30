@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 from collections import Counter, defaultdict
 from datetime import datetime
@@ -13,8 +14,6 @@ import pyqtgraph as pg
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 from pyqtgraph.Qt import QtCore
-from pyqtgraph.dockarea.Dock import Dock
-from pyqtgraph.dockarea.DockArea import DockArea
 from PyQt5.QtCore import Qt, QThread, QTimer, pyqtSignal
 from PyQt5.QtGui import QColor, QKeySequence, QPalette
 from PyQt5.QtWidgets import (
@@ -1329,7 +1328,6 @@ class EmbryoLabelingApp(QMainWindow):
         if self.all_depths_window is None:
             self.all_depths_window = AllDepthsWindow(
                 self,
-                ORDERED_FOCAL_DEPTH,
                 self.current_patient_ts,
                 self.current_timepoint,
             )
@@ -2198,45 +2196,64 @@ class EmbryoLabelingApp(QMainWindow):
 
 
 class AllDepthsWindow(QMainWindow):
-    """Dockable window showing all focal depths for the current timepoint."""
+    """Window showing every present focal depth for the current timepoint in a
+    responsive grid that adapts to how many depths a patient actually has."""
 
-    def __init__(self, parent, depths: List[str], patient_ts, timepoint: int):
+    def __init__(self, parent, patient_ts, timepoint: int):
         super().__init__(parent)
-        self.depths = depths
         self.patient_ts = patient_ts
         self.timepoint = timepoint
+        # Keyed by actual depth index so absent depths are simply never built.
         self.depth_items: Dict[int, pg.ImageItem] = {}
+        self.depth_plots: Dict[int, pg.PlotItem] = {}
+        self._grid_depths: List[int] = []
 
         self.setWindowTitle("All Focal Depths")
-        self.setGeometry(100, 100, 1400, 900)
+        self.setGeometry(100, 100, 1200, 850)
         self.setStyleSheet(STYLESHEET)
 
         self.central_widget = QWidget()
         self.setCentralWidget(self.central_widget)
         self.layout = QVBoxLayout(self.central_widget)
 
-        self.reset_button = QPushButton("Reset")
-        self.reset_button.clicked.connect(self.reset_docks)
-        self.layout.addWidget(self.reset_button)
+        self.header_label = QLabel("")
+        self.header_label.setAlignment(Qt.AlignCenter)
+        self.header_label.setStyleSheet(
+            f"color: {C_TEXT}; font-size: 14px; font-weight: 600; padding: 6px;"
+        )
+        self.layout.addWidget(self.header_label)
 
-        self.dock_area: Optional[DockArea] = None
-        self._build_dock_area()
+        self.grid_container = QWidget()
+        self.grid_layout = QGridLayout(self.grid_container)
+        self.grid_layout.setSpacing(6)
+        self.layout.addWidget(self.grid_container, stretch=1)
+
         self.update_images(patient_ts, timepoint)
 
-    def _build_dock_area(self) -> None:
-        if self.dock_area is not None:
-            self.layout.removeWidget(self.dock_area)
-            self.dock_area.setParent(None)
-
-        self.dock_area = DockArea()
-        self.layout.addWidget(self.dock_area)
+    def _build_grid(self, depth_indices: List[int]) -> None:
+        """(Re)build one image pane per present focal depth in a near-square grid."""
+        while self.grid_layout.count():
+            item = self.grid_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.setParent(None)
         self.depth_items.clear()
+        self.depth_plots.clear()
+        self._grid_depths = list(depth_indices)
 
-        docks: List[Dock] = []
-        for i, depth in enumerate(self.depths):
-            dock = Dock(depth, size=(450, 320), closable=True)
+        count = len(depth_indices)
+        if count == 0:
+            return
+
+        # Near-square arrangement so panes stay large regardless of depth count.
+        columns = math.ceil(math.sqrt(count))
+        for position, depth_index in enumerate(depth_indices):
+            row, col = divmod(position, columns)
+            depth_name = self.patient_ts.get_depth_name(depth_index)
+
             glw = pg.GraphicsLayoutWidget()
-            plot = glw.addPlot(title=depth)
+            glw.setBackground(C_IMG_BG)
+            plot = glw.addPlot(title=depth_name)
             plot.setAspectLocked(True)
             plot.hideAxis("left")
             plot.hideAxis("bottom")
@@ -2244,36 +2261,45 @@ class AllDepthsWindow(QMainWindow):
 
             image_item = pg.ImageItem()
             plot.addItem(image_item)
-            dock.addWidget(glw)
-
-            docks.append(dock)
-            self.depth_items[i] = image_item
-
-        # Deterministic default: row 1 has 0,1,2; row 2 has 3,4,5; row 3 has 6.
-        self.dock_area.addDock(docks[0], "left")
-        self.dock_area.addDock(docks[1], "right", docks[0])
-        self.dock_area.addDock(docks[2], "right", docks[1])
-        self.dock_area.addDock(docks[3], "bottom", docks[0])
-        self.dock_area.addDock(docks[4], "right", docks[3])
-        self.dock_area.addDock(docks[5], "right", docks[4])
-        self.dock_area.addDock(docks[6], "bottom", docks[3])
+            self.grid_layout.addWidget(glw, row, col)
+            self.depth_items[depth_index] = image_item
+            self.depth_plots[depth_index] = plot
 
     def update_images(self, patient_ts, timepoint: int) -> None:
         self.patient_ts = patient_ts
         self.timepoint = timepoint
-        for depth_index, image_item in list(self.depth_items.items()):
-            if not patient_ts.depth_has_images(depth_index):
-                continue
+
+        populated = patient_ts.populated_depth_indices()
+        if populated != self._grid_depths:
+            self._build_grid(populated)
+
+        for depth_index, image_item in self.depth_items.items():
             try:
                 image = patient_ts.get_image(timepoint, depth_index)
                 image_item.setImage(image.T)
-            except RuntimeError:
-                # The user may have closed this dock; reset restores it.
+            except (RuntimeError, IndexError):
                 continue
 
-    def reset_docks(self) -> None:
-        self._build_dock_area()
-        self.update_images(self.patient_ts, self.timepoint)
+        self._refresh_chrome()
+
+    def _refresh_chrome(self) -> None:
+        """Update the header and highlight the depth currently being labeled."""
+        parent = self.parent()
+        current_depth = getattr(parent, "current_depth", None)
+
+        for depth_index, plot in self.depth_plots.items():
+            name = self.patient_ts.get_depth_name(depth_index)
+            if depth_index == current_depth:
+                plot.setTitle(f"▸ {name}", color=C_ACCENT, bold=True)
+            else:
+                plot.setTitle(name, color=C_MUTED)
+
+        patient_id = getattr(self.patient_ts, "patient_id", "")
+        count = len(self._grid_depths)
+        suffix = "depth" if count == 1 else "depths"
+        self.header_label.setText(
+            f"{patient_id}   ·   timepoint {self.timepoint + 1}   ·   {count} {suffix}"
+        )
 
     def closeEvent(self, event) -> None:
         parent = self.parent()
