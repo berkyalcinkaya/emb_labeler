@@ -7,8 +7,6 @@ timepoints, and focal depths** — with optional assisted labeling (OCR clock ti
 stage predictions, RCNN embryo ROI) and a pixel-level **segmentation pane** for tPN / tB
 masks.
 
-![Main labeling window](docs/images/main-window.png)
-
 ## Quick start
 
 ```bash
