@@ -1,6 +1,7 @@
 # Embryo Labeler
 
 [![Demo video](https://img.youtube.com/vi/1FnU7oKbJ0c/maxresdefault.jpg)](https://youtu.be/1FnU7oKbJ0c)
+*&#9654; Click to watch the demo video*
 
 A keyboard-first desktop GUI for labeling time-lapse embryo images across **patients,
 timepoints, and focal depths** — with optional assisted labeling (OCR clock times, model
